@@ -287,6 +287,14 @@ class BetterPlayerController {
   ///master playlist.
   Future<void> _setupAsmsDataSource(BetterPlayerDataSource source) async {
     final String? data = await BetterPlayerAsmsUtils.getDataFromUrl(betterPlayerDataSource!.url, _getHeaders());
+    // This future is started unawaited from setupDataSource, so it outlives the
+    // awaited setup call. During the network fetch above the controller may have
+    // been disposed or recycled (the app nulls videoPlayerController to free the
+    // native player while keeping the Dart shell). Bail before touching torn-down
+    // state — otherwise setAudioTrack below throws an uncaught StateError.
+    if (_disposed || videoPlayerController == null || betterPlayerDataSource == null) {
+      return;
+    }
     if (data != null) {
       final BetterPlayerAsmsDataHolder response = await BetterPlayerAsmsUtils.parse(data, betterPlayerDataSource!.url);
 
@@ -316,7 +324,10 @@ class BetterPlayerController {
       ///Load audio tracks
       if ((betterPlayerDataSource?.useAsmsAudioTracks ?? false) && _isDataSourceAsms(betterPlayerDataSource!)) {
         _betterPlayerAsmsAudioTracks = response.audios ?? [];
-        if (_betterPlayerAsmsAudioTracks?.isNotEmpty ?? false) {
+        // Re-check: the parse() await above is another async gap the controller
+        // can be torn down across. setAudioTrack throws if videoPlayerController
+        // is null, and this future is unawaited so it would crash the app.
+        if ((_betterPlayerAsmsAudioTracks?.isNotEmpty ?? false) && !_disposed && videoPlayerController != null) {
           setAudioTrack(_betterPlayerAsmsAudioTracks!.first);
         }
       }
