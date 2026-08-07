@@ -38,7 +38,9 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
+import android.media.MediaCodec
 import androidx.media3.common.PlaybackException
+import androidx.media3.exoplayer.mediacodec.MediaCodecRenderer
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
@@ -504,7 +506,36 @@ internal class BetterPlayer(
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                eventSink.error("VideoError", "Video player had error $error", "")
+                // Forward the media3 errorCode and the full cause chain —
+                // "$error" alone drops both, making decoder-init failures
+                // (resource exhaustion), runtime codec deaths and our own
+                // lifecycle races (IllegalStateException) indistinguishable
+                // in video_error analytics.
+                val details = StringBuilder()
+                    .append(error.errorCodeName)
+                    .append('(').append(error.errorCode).append("): ")
+                    .append(error.message)
+                var cause: Throwable? = error.cause
+                var depth = 0
+                while (cause != null && depth < 5) {
+                    details.append(" <- ")
+                        .append(cause.javaClass.simpleName)
+                        .append(": ").append(cause.message)
+                    when (cause) {
+                        is MediaCodecRenderer.DecoderInitializationException ->
+                            details.append(" [codec=").append(cause.codecInfo?.name)
+                                .append(" diag=").append(cause.diagnosticInfo)
+                                .append(']')
+                        is MediaCodec.CodecException ->
+                            details.append(" [diag=").append(cause.diagnosticInfo)
+                                .append(" recoverable=").append(cause.isRecoverable)
+                                .append(" transient=").append(cause.isTransient)
+                                .append(']')
+                    }
+                    cause = cause.cause
+                    depth++
+                }
+                eventSink.error("VideoError", details.toString(), "")
             }
         })
         val reply: MutableMap<String, Any> = HashMap()
