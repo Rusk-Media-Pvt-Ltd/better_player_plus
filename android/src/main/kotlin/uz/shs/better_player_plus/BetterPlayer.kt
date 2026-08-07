@@ -49,6 +49,7 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.dash.DashMediaSource
@@ -113,7 +114,15 @@ internal class BetterPlayer(
             this.customDefaultLoadControl.bufferForPlaybackAfterRebufferMs
         )
         loadControl = loadBuilder.build()
+        // Fall back to lower-priority decoders (e.g. the software
+        // c2.android.avc.decoder) when hardware decoder INIT fails —
+        // entry/mid SoCs exhaust video-core memory under concurrent 1080p
+        // sessions (MediaCodec NO_MEMORY at native_start). Init-time only;
+        // mid-playback codec errors are unaffected.
         exoPlayer = ExoPlayer.Builder(context)
+            .setRenderersFactory(
+                DefaultRenderersFactory(context).setEnableDecoderFallback(true)
+            )
             .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
             .build()
