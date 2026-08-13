@@ -32,6 +32,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     public var playerRate: Float = 1.0
     public var overriddenDuration: Int = 0
     public var lastAvPlayerTimeControlStatus: AVPlayer.TimeControlStatus? = nil
+    public var preferredForwardBufferDuration: TimeInterval = 0
 
     private var pipController: AVPictureInPictureController?
     private var restoreUIOnPipStop: ((Bool) -> Void)?
@@ -192,6 +193,13 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         self.stalledCount = 0
         self.isStalledCheckStarted = false
         self.playerRate = 1
+        // Mirrors the minBufferMs the Dart layer already sends for ExoPlayer
+        // (Android) via BetterPlayerBufferingConfiguration, which this iOS
+        // path previously never read. Gives AVPlayer an explicit buffer floor
+        // to offset automaticallyWaitsToMinimizeStalling being disabled above.
+        if #available(iOS 10.0, *), preferredForwardBufferDuration > 0 {
+            item.preferredForwardBufferDuration = preferredForwardBufferDuration
+        }
         player.replaceCurrentItem(with: item)
 
         let asset = item.asset
@@ -225,7 +233,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
                 play()
             } else {
                 stalledCount += 1
-                if stalledCount > 60 {
+                if stalledCount > 20 {
                     if let eventSink = eventSink {
                         let error = FlutterError(code: "VideoError", message: "Failed to load video: playback stalled", details: nil)
                         eventSink(error)
