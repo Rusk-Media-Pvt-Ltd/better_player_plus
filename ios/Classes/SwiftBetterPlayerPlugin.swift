@@ -214,9 +214,16 @@ extension SwiftBetterPlayerPlugin {
             // by ExoPlayer on Android. AVPlayerItem exposes a single forward-buffer
             // knob rather than separate min/max, so minBufferMs is the closest
             // match for "buffer this much before we risk stalling".
-            if let argsMap = call.arguments as? [String: Any],
-               let minBufferMs = argsMap["minBufferMs"] as? NSNumber {
-                player.preferredForwardBufferDuration = minBufferMs.doubleValue / 1000.0
+            if let argsMap = call.arguments as? [String: Any] {
+                if let minBufferMs = argsMap["minBufferMs"] as? NSNumber {
+                    player.preferredForwardBufferDuration = minBufferMs.doubleValue / 1000.0
+                }
+                // BetterPlayerBufferingConfiguration.bufferForPlaybackMs — the
+                // minimum buffered duration required before playback is allowed
+                // to start, matching ExoPlayer's semantics for this field.
+                if let bufferForPlaybackMs = argsMap["bufferForPlaybackMs"] as? NSNumber {
+                    player.bufferForPlaybackDuration = bufferForPlaybackMs.doubleValue / 1000.0
+                }
             }
             onPlayerSetup(player, result: result)
             return

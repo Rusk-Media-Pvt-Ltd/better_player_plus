@@ -33,6 +33,11 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     public var overriddenDuration: Int = 0
     public var lastAvPlayerTimeControlStatus: AVPlayer.TimeControlStatus? = nil
     public var preferredForwardBufferDuration: TimeInterval = 0
+    // Minimum buffered duration required before playback is allowed to start.
+    // Needed because automaticallyWaitsToMinimizeStalling is disabled above,
+    // which otherwise lets AVPlayer start playing the instant it's ready,
+    // with no regard for how little has actually been buffered.
+    public var bufferForPlaybackDuration: TimeInterval = 0
 
     private var pipController: AVPictureInPictureController?
     private var restoreUIOnPipStop: ((Bool) -> Void)?
@@ -233,7 +238,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
                 play()
             } else {
                 stalledCount += 1
-                if stalledCount > 20 {
+                if stalledCount > 60 {
                     if let eventSink = eventSink {
                         let error = FlutterError(code: "VideoError", message: "Failed to load video: playback stalled", details: nil)
                         eventSink(error)
@@ -246,6 +251,12 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     }
 
     @objc private func startStalledCheckObjC() { startStalledCheck() }
+
+    private func hasEnoughStartupBuffer() -> Bool {
+        guard bufferForPlaybackDuration > 0 else { return true }
+        if player.currentItem?.isPlaybackLikelyToKeepUp == true { return true }
+        return availableDuration() >= bufferForPlaybackDuration
+    }
 
     private func availableDuration() -> TimeInterval {
         guard let timeRange = player.currentItem?.loadedTimeRanges.first?.timeRangeValue else { return 0 }
@@ -370,7 +381,13 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         }
 
         isInitialized = true
-        updatePlayingState()
+        if hasEnoughStartupBuffer() {
+            updatePlayingState()
+        }
+        // else: leave playback paused for now. The playbackLikelyToKeepUp KVO
+        // observer below already calls updatePlayingState() as soon as
+        // AVFoundation reports enough buffer to keep up, so this state isn't
+        // stuck — it just waits instead of starting on an empty buffer.
         eventSink(["event": "initialized",
                    "duration": NSNumber(value: duration()),
                    "width": NSNumber(value: Float(width)),
