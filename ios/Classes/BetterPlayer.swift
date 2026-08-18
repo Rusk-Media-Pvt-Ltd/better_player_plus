@@ -32,6 +32,12 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     public var playerRate: Float = 1.0
     public var overriddenDuration: Int = 0
     public var lastAvPlayerTimeControlStatus: AVPlayer.TimeControlStatus? = nil
+    public var preferredForwardBufferDuration: TimeInterval = 0
+    // Minimum buffered duration required before playback is allowed to start.
+    // Needed because automaticallyWaitsToMinimizeStalling is disabled above,
+    // which otherwise lets AVPlayer start playing the instant it's ready,
+    // with no regard for how little has actually been buffered.
+    public var bufferForPlaybackDuration: TimeInterval = 0
 
     private var pipController: AVPictureInPictureController?
     private var restoreUIOnPipStop: ((Bool) -> Void)?
@@ -192,6 +198,13 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         self.stalledCount = 0
         self.isStalledCheckStarted = false
         self.playerRate = 1
+        // Mirrors the minBufferMs the Dart layer already sends for ExoPlayer
+        // (Android) via BetterPlayerBufferingConfiguration, which this iOS
+        // path previously never read. Gives AVPlayer an explicit buffer floor
+        // to offset automaticallyWaitsToMinimizeStalling being disabled above.
+        if #available(iOS 10.0, *), preferredForwardBufferDuration > 0 {
+            item.preferredForwardBufferDuration = preferredForwardBufferDuration
+        }
         player.replaceCurrentItem(with: item)
 
         let asset = item.asset
@@ -238,6 +251,12 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     }
 
     @objc private func startStalledCheckObjC() { startStalledCheck() }
+
+    private func hasEnoughStartupBuffer() -> Bool {
+        guard bufferForPlaybackDuration > 0 else { return true }
+        if player.currentItem?.isPlaybackLikelyToKeepUp == true { return true }
+        return availableDuration() >= bufferForPlaybackDuration
+    }
 
     private func availableDuration() -> TimeInterval {
         guard let timeRange = player.currentItem?.loadedTimeRanges.first?.timeRangeValue else { return 0 }
@@ -362,7 +381,13 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         }
 
         isInitialized = true
-        updatePlayingState()
+        if hasEnoughStartupBuffer() {
+            updatePlayingState()
+        }
+        // else: leave playback paused for now. The playbackLikelyToKeepUp KVO
+        // observer below already calls updatePlayingState() as soon as
+        // AVFoundation reports enough buffer to keep up, so this state isn't
+        // stuck — it just waits instead of starting on an empty buffer.
         eventSink(["event": "initialized",
                    "duration": NSNumber(value: duration()),
                    "width": NSNumber(value: Float(width)),
