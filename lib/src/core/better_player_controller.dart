@@ -511,7 +511,11 @@ class BetterPlayerController {
   ///Initializes video based on configuration. Invoke actions which need to be
   ///run on player start.
   Future<void> _initializeVideo() async {
-    unawaited(setLooping(betterPlayerConfiguration.looping));
+    // Unawaited on purpose, but a concurrent external dispose can null
+    // videoPlayerController while setup is still in flight — setLooping's
+    // StateError would then surface as an UNCATCHABLE async error. Swallow it:
+    // looping on a player that no longer exists is a no-op by definition.
+    unawaited(setLooping(betterPlayerConfiguration.looping).catchError((Object _) {}));
     if (_videoEventStreamSubscription != null) {
       unawaited(_videoEventStreamSubscription!.cancel());
       _videoEventStreamSubscription = null;

@@ -386,6 +386,22 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     await _creatingCompleter.future;
     if (!_isDisposed) {
       _isDisposed = true;
+      // Unblock any in-flight setDataSource: its future only completes on the
+      // `initialized` event, which can never arrive once the subscription is
+      // cancelled and the platform player disposed — without this, an external
+      // dispose mid-setup leaves the awaiter (and anything serialized behind
+      // it) hung forever. Completed as an error so the caller's catch runs;
+      // the extra catchError keeps it handled even with no active awaiter.
+      try {
+        if (!_initializingCompleter.isCompleted) {
+          _initializingCompleter.completeError(
+              StateError('VideoPlayerController disposed during initialization'));
+          unawaited(_initializingCompleter.future.catchError((Object _) {}));
+        }
+      } catch (_) {
+        // _initializingCompleter is `late` — never created means no
+        // setDataSource was in flight; nothing to unblock.
+      }
       value = VideoPlayerValue.uninitialized();
       _timer?.cancel();
       await _eventSubscription?.cancel();
@@ -552,6 +568,14 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// [height] specifies height of the selected track
   /// [bitrate] specifies bitrate of the selected track
   Future<void> setTrackParameters(int? width, int? height, int? bitrate) async {
+    // A call issued before the native player exists targeted a null textureId
+    // and was silently dropped — so a size cap set around setupDataSource never
+    // constrained ExoPlayer's INITIAL track selection (fresh players could
+    // start on a 1080p rung despite the cap). Waiting for create makes the
+    // parameters land on the trackSelector before prepare's first selection.
+    if (!_creatingCompleter.isCompleted) {
+      await _creatingCompleter.future;
+    }
     await _videoPlayerPlatform.setTrackParameters(_textureId, width, height, bitrate);
   }
 
