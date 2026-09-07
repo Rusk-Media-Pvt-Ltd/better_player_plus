@@ -19,7 +19,7 @@ import uz.shs.better_player_plus.DataSourceUtils.getUserAgent
 import uz.shs.better_player_plus.DataSourceUtils.isHTTP
 import uz.shs.better_player_plus.DataSourceUtils.getDataSourceFactory
 import io.flutter.plugin.common.EventChannel
-import io.flutter.view.TextureRegistry.SurfaceTextureEntry
+import io.flutter.view.TextureRegistry.SurfaceProducer
 import io.flutter.plugin.common.MethodChannel
 import androidx.media3.ui.PlayerNotificationManager
 import androidx.work.WorkManager
@@ -28,7 +28,6 @@ import androidx.media3.ui.PlayerNotificationManager.MediaDescriptionAdapter
 import androidx.media3.ui.PlayerNotificationManager.BitmapCallback
 import androidx.work.OneTimeWorkRequest
 import android.util.Log
-import android.view.Surface
 import androidx.annotation.OptIn
 import androidx.lifecycle.Observer
 import androidx.media3.extractor.DefaultExtractorsFactory
@@ -80,7 +79,7 @@ import androidx.core.net.toUri
 internal class BetterPlayer(
     context: Context,
     private val eventChannel: EventChannel,
-    private val textureEntry: SurfaceTextureEntry,
+    private val surfaceProducer: SurfaceProducer,
     customDefaultLoadControl: CustomDefaultLoadControl?,
     result: MethodChannel.Result
 ) {
@@ -89,7 +88,6 @@ internal class BetterPlayer(
     private val trackSelector: DefaultTrackSelector = DefaultTrackSelector(context)
     private val loadControl: LoadControl
     private var isInitialized = false
-    private var surface: Surface? = null
     private var key: String? = null
     private var playerNotificationManager: PlayerNotificationManager? = null
     private var refreshHandler: Handler? = null
@@ -119,7 +117,7 @@ internal class BetterPlayer(
             .build()
         workManager = WorkManager.getInstance(context)
         workerObserverMap = HashMap()
-        setupVideoPlayer(eventChannel, textureEntry, result)
+        setupVideoPlayer(eventChannel, surfaceProducer, result)
     }
 
     @OptIn(UnstableApi::class)
@@ -445,7 +443,7 @@ internal class BetterPlayer(
     }
 
     private fun setupVideoPlayer(
-        eventChannel: EventChannel, textureEntry: SurfaceTextureEntry, result: MethodChannel.Result
+        eventChannel: EventChannel, surfaceProducer: SurfaceProducer, result: MethodChannel.Result
     ) {
         eventChannel.setStreamHandler(
             object : EventChannel.StreamHandler {
@@ -458,8 +456,21 @@ internal class BetterPlayer(
                 }
             },
         )
-        surface = Surface(textureEntry.surfaceTexture())
-        exoPlayer?.setVideoSurface(surface)
+        // SurfaceProducer (Impeller-native) instead of the legacy SurfaceTexture:
+        // the old path soft-fails Vulkan validation on every frame ("Invalid
+        // external texture", ~1/s) and flashed garbage on repaint on some
+        // devices. The producer owns the Surface; on lifecycle teardown it
+        // must be re-fetched, not recreated by us.
+        surfaceProducer.setCallback(object : SurfaceProducer.Callback {
+            override fun onSurfaceAvailable() {
+                exoPlayer?.setVideoSurface(surfaceProducer.surface)
+            }
+
+            override fun onSurfaceCleanup() {
+                exoPlayer?.setVideoSurface(null)
+            }
+        })
+        exoPlayer?.setVideoSurface(surfaceProducer.surface)
         setAudioAttributes(exoPlayer, true)
         exoPlayer?.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -499,7 +510,7 @@ internal class BetterPlayer(
             }
         })
         val reply: MutableMap<String, Any> = HashMap()
-        reply["textureId"] = textureEntry.id()
+        reply["textureId"] = surfaceProducer.id()
         result.success(reply)
     }
 
@@ -604,6 +615,9 @@ internal class BetterPlayer(
                     }
                     event["width"] = width
                     event["height"] = height
+                    if (width > 0 && height > 0) {
+                        surfaceProducer.setSize(width, height)
+                    }
                 }
             }
             eventSink.success(event)
@@ -756,9 +770,8 @@ internal class BetterPlayer(
         if (isInitialized) {
             exoPlayer?.stop()
         }
-        textureEntry.release()
+        surfaceProducer.release()
         eventChannel.setStreamHandler(null)
-        surface?.release()
         exoPlayer?.release()
     }
 
@@ -767,12 +780,11 @@ internal class BetterPlayer(
         if (other == null || javaClass != other.javaClass) return false
         val that = other as BetterPlayer
         if (if (exoPlayer != null) exoPlayer != that.exoPlayer else that.exoPlayer != null) return false
-        return if (surface != null) surface == that.surface else that.surface == null
+        return true
     }
 
     override fun hashCode(): Int {
         var result = exoPlayer?.hashCode() ?: 0
-        result = 31 * result + (surface?.hashCode() ?: 0)
         return result
     }
 
