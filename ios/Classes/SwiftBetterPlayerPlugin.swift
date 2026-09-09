@@ -229,7 +229,19 @@ extension SwiftBetterPlayerPlugin {
             return
         }
 
-        guard let argsMap = call.arguments as? [String: Any], let textureId = (argsMap["textureId"] as? NSNumber)?.int64Value, let player = players[textureId] else {
+        guard let argsMap = call.arguments as? [String: Any], let textureId = (argsMap["textureId"] as? NSNumber)?.int64Value else {
+            result(FlutterMethodNotImplemented)
+            return
+        }
+        guard let player = players[textureId] else {
+            // Dispose/create race: Dart may still invoke setTrackParameters /
+            // setVolume after the native player was removed. Returning
+            // FlutterMethodNotImplemented becomes a fatal FlutterError on the
+            // Dart side when the Future is unawaited.
+            if call.method == "setTrackParameters" || call.method == "setVolume" || call.method == "setSpeed" {
+                result(nil)
+                return
+            }
             result(FlutterMethodNotImplemented)
             return
         }

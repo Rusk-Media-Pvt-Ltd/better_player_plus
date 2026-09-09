@@ -551,8 +551,22 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
   /// [width] specifies width of the selected track
   /// [height] specifies height of the selected track
   /// [bitrate] specifies bitrate of the selected track
+  ///
+  /// No-ops when the native player is not created yet or already disposed.
+  /// The platform channel returns FlutterMethodNotImplemented for a missing
+  /// texture, which Dart throws as [MissingPluginException] / FlutterError
+  /// if this Future is dropped (BetterPlayerController.setTrack is unawaited).
   Future<void> setTrackParameters(int? width, int? height, int? bitrate) async {
-    await _videoPlayerPlatform.setTrackParameters(_textureId, width, height, bitrate);
+    if (!_created || _isDisposed || _textureId == null) {
+      return;
+    }
+    try {
+      await _videoPlayerPlatform.setTrackParameters(_textureId, width, height, bitrate);
+    } on MissingPluginException {
+      // Native player gone (dispose race) or texture never registered.
+    } on PlatformException {
+      // iOS returns FlutterMethodNotImplemented for an unknown textureId.
+    }
   }
 
   Future<void> enablePictureInPicture({double? top, double? left, double? width, double? height}) async {
