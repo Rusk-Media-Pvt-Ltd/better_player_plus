@@ -124,10 +124,19 @@ class MethodChannelVideoPlayer extends VideoPlayerPlatform {
       _channel.invokeMethod<void>('setSpeed', <String, dynamic>{'textureId': textureId, 'speed': speed});
 
   @override
-  Future<void> setTrackParameters(int? textureId, int? width, int? height, int? bitrate) => _channel.invokeMethod<void>(
-    'setTrackParameters',
-    <String, dynamic>{'textureId': textureId, 'width': width, 'height': height, 'bitrate': bitrate},
-  );
+  Future<void> setTrackParameters(int? textureId, int? width, int? height, int? bitrate) async {
+    if (textureId == null) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod<void>(
+        'setTrackParameters',
+        <String, dynamic>{'textureId': textureId, 'width': width, 'height': height, 'bitrate': bitrate},
+      );
+    } on MissingPluginException {
+      // iOS returns FlutterMethodNotImplemented when the native player is gone.
+    }
+  }
 
   @override
   Future<void> seekTo(int? textureId, Duration? position) => _channel.invokeMethod<void>('seekTo', <String, dynamic>{
