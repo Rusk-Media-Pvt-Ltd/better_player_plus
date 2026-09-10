@@ -628,7 +628,11 @@ class VideoPlayer extends StatefulWidget {
 class _VideoPlayerState extends State<VideoPlayer> {
   _VideoPlayerState() {
     _listener = () {
-      final int? newTextureId = widget.controller!.textureId;
+      // Controller is nullable: pool/dispose races can mount VideoPlayer with
+      // a null controller (see BetterPlayerVideoFitWidget). Never bang it.
+      final controller = widget.controller;
+      if (controller == null) return;
+      final int? newTextureId = controller.textureId;
       if (newTextureId != _textureId) {
         setState(() {
           _textureId = newTextureId;
@@ -643,28 +647,40 @@ class _VideoPlayerState extends State<VideoPlayer> {
   @override
   void initState() {
     super.initState();
-    _textureId = widget.controller!.textureId;
+    final controller = widget.controller;
+    if (controller == null) return;
+    _textureId = controller.textureId;
     // Need to listen for initialization events since the actual texture ID
     // becomes available after asynchronous initialization finishes.
-    widget.controller!.addListener(_listener);
+    controller.addListener(_listener);
   }
 
   @override
   void didUpdateWidget(VideoPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    oldWidget.controller!.removeListener(_listener);
-    _textureId = widget.controller!.textureId;
-    widget.controller!.addListener(_listener);
+    oldWidget.controller?.removeListener(_listener);
+    final controller = widget.controller;
+    if (controller == null) {
+      _textureId = null;
+      return;
+    }
+    _textureId = controller.textureId;
+    controller.addListener(_listener);
   }
 
   @override
   void deactivate() {
+    widget.controller?.removeListener(_listener);
     super.deactivate();
-    widget.controller!.removeListener(_listener);
   }
 
   @override
-  Widget build(BuildContext context) => _textureId == null ? Container() : _videoPlayerPlatform.buildView(_textureId);
+  Widget build(BuildContext context) {
+    if (widget.controller == null || _textureId == null) {
+      return const SizedBox.shrink();
+    }
+    return _videoPlayerPlatform.buildView(_textureId);
+  }
 }
 
 /// Used to configure the [VideoProgressIndicator] widget's colors for how it

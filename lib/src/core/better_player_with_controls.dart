@@ -263,11 +263,15 @@ class _BetterPlayerVideoFitWidgetState extends State<_BetterPlayerVideoFitWidget
 
   @override
   Widget build(BuildContext context) {
-    if (_initialized && _started) {
+    // `_initialized && _started` can still be true while the pool/dispose path
+    // has already nulled `videoPlayerController`. Mounting VideoPlayer(null)
+    // previously crashed in initState on `controller!` (Crashlytics FlutterError).
+    final activeController = controller;
+    if (_initialized && _started && activeController != null) {
       // iOS platform views (UiKitView) don't play well with Clip/Transform/FittedBox.
       // Render the platform view directly to avoid black screen.
       if (Platform.isIOS) {
-        return SizedBox.expand(child: VideoPlayer(controller));
+        return SizedBox.expand(child: VideoPlayer(activeController));
       }
       return Center(
         child: ClipRect(
@@ -275,9 +279,9 @@ class _BetterPlayerVideoFitWidgetState extends State<_BetterPlayerVideoFitWidget
             child: FittedBox(
               fit: widget.boxFit,
               child: SizedBox(
-                width: max(1, controller?.value.size?.width ?? 1.0),
-                height: max(1, controller?.value.size?.height ?? 1.0),
-                child: VideoPlayer(controller),
+                width: max(1, activeController.value.size?.width ?? 1.0),
+                height: max(1, activeController.value.size?.height ?? 1.0),
+                child: VideoPlayer(activeController),
               ),
             ),
           ),
