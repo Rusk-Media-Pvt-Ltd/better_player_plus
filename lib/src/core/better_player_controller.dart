@@ -511,7 +511,13 @@ class BetterPlayerController {
   ///Initializes video based on configuration. Invoke actions which need to be
   ///run on player start.
   Future<void> _initializeVideo() async {
-    unawaited(setLooping(betterPlayerConfiguration.looping));
+    // Do not use unawaited(setLooping): VideoPool can null videoPlayerController
+    // mid-setup (recycle / dispose race). setLooping used to throw StateError
+    // which then escaped as a fatal FlutterError on iOS Crashlytics.
+    await setLooping(betterPlayerConfiguration.looping);
+    if (_disposed || videoPlayerController == null) {
+      return;
+    }
     if (_videoEventStreamSubscription != null) {
       unawaited(_videoEventStreamSubscription!.cancel());
       _videoEventStreamSubscription = null;
@@ -599,12 +605,24 @@ class BetterPlayerController {
   }
 
   ///Enables/disables looping (infinity playback) mode.
+  ///
+  ///No-ops when the native player was cleared (VideoPool recycle / dispose
+  ///race). Throwing here used to become a fatal FlutterError because
+  ///[_initializeVideo] historically fired this via [unawaited].
   Future<void> setLooping(bool looping) async {
-    if (videoPlayerController == null) {
-      throw StateError('The data source has not been initialized');
+    if (_disposed || videoPlayerController == null) {
+      return;
     }
 
-    await videoPlayerController!.setLooping(looping);
+    try {
+      await videoPlayerController!.setLooping(looping);
+    } on StateError {
+      // Inner disposed between the null check and the invoke.
+    } on MissingPluginException {
+      // Native texture gone.
+    } on PlatformException {
+      // Native player missing / FlutterMethodNotImplemented.
+    }
   }
 
   ///Stop video playback.
