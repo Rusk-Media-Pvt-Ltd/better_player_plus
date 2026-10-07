@@ -42,6 +42,16 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     private var pipController: AVPictureInPictureController?
     private var restoreUIOnPipStop: ((Bool) -> Void)?
 
+    // Starting playback while the app is leaving the foreground (no background
+    // audio mode) can leave the rate change waiting forever on the media
+    // server; AVFoundation's main-queue rate callback then blocks on it, the
+    // screen goes black and the watchdog kills the app. So rate changes that
+    // START playback are held until the app is active again, then replayed.
+    private var appIsActive = true
+    private var appStateObservers: [NSObjectProtocol] = []
+
+    private var canStartPlayback: Bool { appIsActive || pictureInPicture }
+
     public override init() {
         self.player = AVPlayer()
         super.init()
@@ -53,6 +63,22 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         self.isInitialized = false
         self.isPlaying = false
         self.disposed = false
+        // Block observers: removeObservers()' removeObserver(self) leaves them be.
+        let center = NotificationCenter.default
+        appStateObservers = [
+            center.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.appIsActive = false
+            },
+            center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                guard let self = self else { return }
+                self.appIsActive = true
+                if self.isPlaying && !self.disposed { self.updatePlayingState() }
+            },
+        ]
+    }
+
+    deinit {
+        appStateObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
     public convenience init(frame: CGRect) {
@@ -338,6 +364,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         guard isInitialized, key != nil else { return }
         if !observersAdded, let current = player.currentItem { addObservers(current) }
         if isPlaying {
+            guard canStartPlayback else { return }
             if #available(iOS 10.0, *) {
                 player.playImmediately(atRate: 1.0)
                 player.rate = playerRate
@@ -434,7 +461,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         if wasPlaying { player.pause() }
         player.seek(to: CMTimeMake(value: Int64(location), timescale: 1000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             guard let self = self else { return }
-            if wasPlaying { self.player.rate = self.playerRate }
+            if wasPlaying && self.canStartPlayback { self.player.rate = self.playerRate }
         }
     }
 
@@ -458,7 +485,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
             }
         }
 
-        if isPlaying {
+        if isPlaying && canStartPlayback {
             if #available(iOS 16, *) {
                 player.defaultRate = Float(speed)
             }
