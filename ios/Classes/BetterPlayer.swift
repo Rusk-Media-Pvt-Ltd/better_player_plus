@@ -70,9 +70,14 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
                 self?.appIsActive = false
             },
             center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-                guard let self = self else { return }
-                self.appIsActive = true
-                if self.isPlaying && !self.disposed { self.updatePlayingState() }
+                // No auto-replay here: the Dart side's own lifecycle handler
+                // (VideoPoolBloc._onAppForegrounded) already re-issues play
+                // on resume. Replaying here too raced it after a long lock —
+                // two near-simultaneous rate changes right as the media
+                // server connection is cold reproduced the same deadlock
+                // this guard exists to prevent (screen frozen, audio still
+                // playing, force-kill required).
+                self?.appIsActive = true
             },
         ]
     }
