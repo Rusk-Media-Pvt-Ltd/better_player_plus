@@ -224,6 +224,9 @@ extension SwiftBetterPlayerPlugin {
                 if let bufferForPlaybackMs = argsMap["bufferForPlaybackMs"] as? NSNumber {
                     player.bufferForPlaybackDuration = bufferForPlaybackMs.doubleValue / 1000.0
                 }
+                if let rebufferMs = argsMap["bufferForPlaybackAfterRebufferMs"] as? NSNumber {
+                    player.bufferForPlaybackAfterRebufferDuration = rebufferMs.doubleValue / 1000.0
+                }
             }
             onPlayerSetup(player, result: result)
             return

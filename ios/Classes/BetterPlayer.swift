@@ -38,6 +38,17 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     // which otherwise lets AVPlayer start playing the instant it's ready,
     // with no regard for how little has actually been buffered.
     public var bufferForPlaybackDuration: TimeInterval = 0
+    // Buffer ahead of the playhead required to resume after a stall — ExoPlayer's
+    // bufferForPlaybackAfterRebufferMs. 0 keeps the old 10s fallback.
+    public var bufferForPlaybackAfterRebufferDuration: TimeInterval = 0
+    // Track cap kept on the player, like ExoPlayer's trackSelector which lives as
+    // long as the player. AVPlayerItem holds it per item, so without this every
+    // replaceCurrentItem starts uncapped (first-listed, often 1080p, rendition).
+    private var maxResolution: CGSize = .zero
+    // seekTo pauses (rate 0) while isPlaying stays true; the buffer and rate
+    // observers must not restart playback before the seek completes.
+    private var pendingSeeks = 0
+    private var peakBitRate: Double = 0
 
     private var pipController: AVPictureInPictureController?
     private var restoreUIOnPipStop: ((Bool) -> Void)?
@@ -236,6 +247,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         if #available(iOS 10.0, *), preferredForwardBufferDuration > 0 {
             item.preferredForwardBufferDuration = preferredForwardBufferDuration
         }
+        applyTrackCap(item)
         player.replaceCurrentItem(with: item)
 
         let asset = item.asset
@@ -258,14 +270,15 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     }
 
     private func handleStalled() {
-        if isStalledCheckStarted { return }
+        if isStalledCheckStarted || pendingSeeks > 0 { return }
         isStalledCheckStarted = true
         startStalledCheck()
     }
 
     private func startStalledCheck() {
         if let currentItem = player.currentItem {
-            if currentItem.isPlaybackLikelyToKeepUp || (availableDuration() - CMTimeGetSeconds(currentItem.currentTime())) > 10.0 {
+            let resumeBuffer = bufferForPlaybackAfterRebufferDuration > 0 ? bufferForPlaybackAfterRebufferDuration : 10.0
+            if currentItem.isPlaybackLikelyToKeepUp || bufferedAhead() >= resumeBuffer {
                 play()
             } else {
                 stalledCount += 1
@@ -286,14 +299,22 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     private func hasEnoughStartupBuffer() -> Bool {
         guard bufferForPlaybackDuration > 0 else { return true }
         if player.currentItem?.isPlaybackLikelyToKeepUp == true { return true }
-        return availableDuration() >= bufferForPlaybackDuration
+        return bufferedAhead() >= bufferForPlaybackDuration
     }
 
-    private func availableDuration() -> TimeInterval {
-        guard let timeRange = player.currentItem?.loadedTimeRanges.first?.timeRangeValue else { return 0 }
-        let startSeconds = CMTimeGetSeconds(timeRange.start)
-        let durationSeconds = CMTimeGetSeconds(timeRange.duration)
-        return startSeconds + durationSeconds
+    // Seconds buffered ahead of the playhead, from the loaded range that contains
+    // it (like ExoPlayer's buffered duration). loadedTimeRanges.first can be a
+    // range behind the playhead after a forward seek or a resume.
+    private func bufferedAhead() -> TimeInterval {
+        guard let item = player.currentItem else { return 0 }
+        let now = item.currentTime()
+        for value in item.loadedTimeRanges {
+            let range = value.timeRangeValue
+            if CMTimeRangeContainsTime(range, time: now) {
+                return CMTimeGetSeconds(CMTimeRangeGetEnd(range)) - CMTimeGetSeconds(now)
+            }
+        }
+        return 0
     }
 
     public override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
@@ -332,6 +353,13 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
                     values.append([start, end])
                 }
                 eventSink(["event": "bufferingUpdate", "values": values, "key": key as Any])
+            }
+            // Startup gate, ExoPlayer-style: start as soon as bufferForPlaybackDuration
+            // is buffered instead of waiting for AVFoundation's (much more
+            // conservative) isPlaybackLikelyToKeepUp. Stall recovery stays with
+            // startStalledCheck, hence the isStalledCheckStarted guard.
+            if isInitialized && isPlaying && player.rate == 0 && !isStalledCheckStarted && pendingSeeks == 0 && hasEnoughStartupBuffer() {
+                updatePlayingState()
             }
         } else if context == &presentationSizeContext {
             onReadyToPlay()
@@ -464,8 +492,11 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     public func seekTo(_ location: Int) {
         let wasPlaying = isPlaying
         if wasPlaying { player.pause() }
+        pendingSeeks += 1
+        // Called for every seek, also with finished=false when a newer seek supersedes it.
         player.seek(to: CMTimeMake(value: Int64(location), timescale: 1000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             guard let self = self else { return }
+            self.pendingSeeks -= 1
             if wasPlaying && self.canStartPlayback { self.player.rate = self.playerRate }
         }
     }
@@ -499,13 +530,26 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     }
 
     public func setTrackParameters(width: Int, height: Int, bitrate: Int) {
-        player.currentItem?.preferredPeakBitRate = Double(bitrate)
+        // Same rules as Android's BetterPlayer.setTrackParameters.
+        if width != 0 && height != 0 {
+            maxResolution = CGSize(width: width, height: height)
+        }
+        if bitrate != 0 {
+            peakBitRate = Double(bitrate)
+        }
+        if width == 0 && height == 0 && bitrate == 0 {
+            maxResolution = .zero
+            peakBitRate = 0
+        }
+        if let item = player.currentItem {
+            applyTrackCap(item)
+        }
+    }
+
+    private func applyTrackCap(_ item: AVPlayerItem) {
+        item.preferredPeakBitRate = peakBitRate
         if #available(iOS 11.0, *) {
-            if width == 0 && height == 0 {
-                player.currentItem?.preferredMaximumResolution = .zero
-            } else {
-                player.currentItem?.preferredMaximumResolution = CGSize(width: width, height: height)
-            }
+            item.preferredMaximumResolution = maxResolution
         }
     }
 
