@@ -248,6 +248,8 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
             item.preferredForwardBufferDuration = preferredForwardBufferDuration
         }
         applyTrackCap(item)
+        pendingSeeks = 0
+        gateLog("new item cap=\(Int(maxResolution.width))x\(Int(maxResolution.height)) bitrate=\(Int(peakBitRate))")
         player.replaceCurrentItem(with: item)
 
         let asset = item.asset
@@ -270,19 +272,30 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     }
 
     private func handleStalled() {
-        if isStalledCheckStarted || pendingSeeks > 0 { return }
+        if isStalledCheckStarted { return }
         isStalledCheckStarted = true
+        gateLog("stall detected pendingSeeks=\(pendingSeeks)")
         startStalledCheck()
     }
 
     private func startStalledCheck() {
         if let currentItem = player.currentItem {
             let resumeBuffer = bufferForPlaybackAfterRebufferDuration > 0 ? bufferForPlaybackAfterRebufferDuration : 10.0
-            if currentItem.isPlaybackLikelyToKeepUp || bufferedAhead() >= resumeBuffer {
+            let ahead = bufferedAhead()
+            // Keep counting while a seek is in flight but don't restart under it.
+            // A seek on an item whose HLS connections died (long lock/background)
+            // may never complete; the 60-try error below is what lets the app
+            // reload the slot, so the check itself must never be skipped.
+            if pendingSeeks == 0 && (currentItem.isPlaybackLikelyToKeepUp || ahead >= resumeBuffer) {
+                gateLog(String(format: "stall -> resume ahead=%.1fs need=%.1fs", ahead, resumeBuffer))
                 play()
             } else {
                 stalledCount += 1
+                gateLog(String(format: "stall check #%d ahead=%.1fs need=%.1fs likely=%@ pendingSeeks=%d",
+                               stalledCount, ahead, resumeBuffer,
+                               currentItem.isPlaybackLikelyToKeepUp ? "y" : "n", pendingSeeks))
                 if stalledCount > 60 {
+                    gateLog("stall -> VideoError playback stalled")
                     if let eventSink = eventSink {
                         let error = FlutterError(code: "VideoError", message: "Failed to load video: playback stalled", details: nil)
                         eventSink(error)
@@ -359,6 +372,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
             // conservative) isPlaybackLikelyToKeepUp. Stall recovery stays with
             // startStalledCheck, hence the isStalledCheckStarted guard.
             if isInitialized && isPlaying && player.rate == 0 && !isStalledCheckStarted && pendingSeeks == 0 && hasEnoughStartupBuffer() {
+                gateLog(String(format: "start gate -> play ahead=%.1fs", bufferedAhead()))
                 updatePlayingState()
             }
         } else if context == &presentationSizeContext {
@@ -493,10 +507,12 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         let wasPlaying = isPlaying
         if wasPlaying { player.pause() }
         pendingSeeks += 1
+        gateLog("seek start to=\(location)ms wasPlaying=\(wasPlaying) pendingSeeks=\(pendingSeeks)")
         // Called for every seek, also with finished=false when a newer seek supersedes it.
-        player.seek(to: CMTimeMake(value: Int64(location), timescale: 1000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        player.seek(to: CMTimeMake(value: Int64(location), timescale: 1000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             guard let self = self else { return }
-            self.pendingSeeks -= 1
+            self.pendingSeeks = max(0, self.pendingSeeks - 1)
+            self.gateLog("seek done finished=\(finished) pendingSeeks=\(self.pendingSeeks)")
             if wasPlaying && self.canStartPlayback { self.player.rate = self.playerRate }
         }
     }
@@ -544,6 +560,14 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         if let item = player.currentItem {
             applyTrackCap(item)
         }
+    }
+
+    private func gateLog(_ message: String) {
+        // Both: stdout reaches `flutter run`, NSLog (os_log) survives a detached
+        // run and shows up in Console / `log collect`.
+        let line = "[BPGate] \(message) key=\(key ?? "-")"
+        print(line)
+        NSLog("%@", line)
     }
 
     private func applyTrackCap(_ item: AVPlayerItem) {
