@@ -412,14 +412,13 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         if !observersAdded, let current = player.currentItem { addObservers(current) }
         if isPlaying {
             guard canStartPlayback else { return }
-            if #available(iOS 10.0, *) {
-                player.playImmediately(atRate: 1.0)
-                player.rate = playerRate
-            } else {
-                player.play()
-                player.rate = playerRate
-            }
-        } else {
+            // Each rate change is a sync XPC to mediaserverd; when it is slow the
+            // main thread blocks reading rate state (app hangs, ALRIGHT-APP-11M).
+            // One SetRate per play, none when already at the target rate.
+            if player.rate != playerRate { player.playImmediately(atRate: playerRate) }
+        } else if player.rate != 0 {
+            // Warm slots land here on every readyToPlay/likelyToKeepUp while
+            // already paused; skip the no-op SetRate.
             player.pause()
         }
     }
