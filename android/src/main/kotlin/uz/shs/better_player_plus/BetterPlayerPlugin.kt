@@ -253,6 +253,8 @@ class BetterPlayerPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
                 result.success(null)
             }
 
+            GET_DIAGNOSTICS_METHOD -> result.success(player.diagnosticsSnapshot())
+
             else -> result.notImplemented()
         }
     }
@@ -584,6 +586,7 @@ class BetterPlayerPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
         private const val SET_MIX_WITH_OTHERS_METHOD = "setMixWithOthers"
         private const val CLEAR_CACHE_METHOD = "clearCache"
         private const val DISPOSE_METHOD = "dispose"
+        private const val GET_DIAGNOSTICS_METHOD = "getDiagnostics"
         private const val PRE_CACHE_METHOD = "preCache"
         private const val STOP_PRE_CACHE_METHOD = "stopPreCache"
     }

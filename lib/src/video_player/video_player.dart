@@ -579,6 +579,15 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     await _videoPlayerPlatform.setTrackParameters(_textureId, width, height, bitrate);
   }
 
+  /// Native player state plus the current source's load/decoder timeline;
+  /// null before the native player exists.
+  Future<String?> getNativeDiagnostics() async {
+    if (_textureId == null) {
+      return null;
+    }
+    return _videoPlayerPlatform.getDiagnostics(_textureId);
+  }
+
   Future<void> enablePictureInPicture({double? top, double? left, double? width, double? height}) async {
     await _videoPlayerPlatform.enablePictureInPicture(textureId, top, left, width, height);
   }
