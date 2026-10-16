@@ -28,6 +28,7 @@ import androidx.media3.ui.PlayerNotificationManager.MediaDescriptionAdapter
 import androidx.media3.ui.PlayerNotificationManager.BitmapCallback
 import androidx.work.OneTimeWorkRequest
 import android.util.Log
+import android.content.pm.ApplicationInfo
 import androidx.annotation.OptIn
 import androidx.lifecycle.Observer
 import androidx.media3.extractor.DefaultExtractorsFactory
@@ -63,6 +64,7 @@ import androidx.media3.exoplayer.drm.FrameworkMediaDrm
 import androidx.media3.exoplayer.drm.HttpMediaDrmCallback
 import androidx.media3.exoplayer.drm.LocalMediaDrmCallback
 import androidx.media3.exoplayer.drm.UnsupportedDrmException
+import androidx.media3.exoplayer.hls.HlsManifest
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.smoothstreaming.DefaultSsChunkSource
 import androidx.media3.exoplayer.smoothstreaming.SsMediaSource
@@ -70,7 +72,20 @@ import androidx.media3.exoplayer.source.ClippingMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import android.os.SystemClock
+import androidx.media3.common.Format
+import androidx.media3.common.ParserException
+import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
+import androidx.media3.datasource.HttpDataSource
+import androidx.media3.exoplayer.DecoderReuseEvaluation
+import androidx.media3.exoplayer.ExoPlaybackException
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.mediacodec.MediaCodecRenderer
+import androidx.media3.exoplayer.source.LoadEventInfo
+import androidx.media3.exoplayer.source.MediaLoadData
 import java.io.File
+import java.io.IOException
 import java.lang.Exception
 import java.lang.IllegalStateException
 import java.util.*
@@ -104,6 +119,456 @@ internal class BetterPlayer(
     private val customDefaultLoadControl: CustomDefaultLoadControl =
         customDefaultLoadControl ?: CustomDefaultLoadControl()
     private var lastSendBufferedPosition = 0L
+
+    // Field devices give us no logcat: every source keeps its own load/decoder
+    // timeline so an error message (or getDiagnostics) can say exactly what
+    // happened. Declared before `init`, which registers the listener.
+    private val diagEvents = ArrayDeque<String>()
+    private var diagSourceSetAtMs = SystemClock.elapsedRealtime()
+    private var diagLoadsOk = 0
+    private var diagLoadsFailed = 0
+
+    // Decoder/render state kept outside the ring so segment loads can never
+    // evict it. Decoders and the surface outlive a source (a reused player
+    // may not re-init them), so they are not reset — [since] marks "prev".
+    private var diagVideoDecoder: String? = null
+    private var diagVideoDecoderAtMs = 0L
+    private var diagAudioDecoder: String? = null
+    private var diagAudioDecoderAtMs = 0L
+    private var diagSurface: String? = null
+    private var diagFirstFrameAtMs: Long? = null
+    private var diagDroppedFrames = 0
+    private var diagCodecError: String? = null
+
+    private fun resetDiagnostics() {
+        diagEvents.clear()
+        diagSourceSetAtMs = SystemClock.elapsedRealtime()
+        diagLoadsOk = 0
+        diagLoadsFailed = 0
+        diagFirstFrameAtMs = null
+        diagDroppedFrames = 0
+        diagCodecError = null
+    }
+
+    private fun since(atMs: Long): String =
+        if (atMs < diagSourceSetAtMs) "prev" else "${atMs - diagSourceSetAtMs}ms"
+
+    private fun diag(event: String) {
+        if (diagEvents.size >= MAX_DIAG_EVENTS) diagEvents.removeFirst()
+        diagEvents.addLast("${SystemClock.elapsedRealtime() - diagSourceSetAtMs}ms $event")
+    }
+
+    private val diagnosticsListener = object : AnalyticsListener {
+        override fun onPlaybackStateChanged(eventTime: AnalyticsListener.EventTime, state: Int) {
+            diag("state=${stateName(state)}")
+        }
+
+        override fun onLoadCompleted(
+            eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo,
+            mediaLoadData: MediaLoadData
+        ) {
+            diagLoadsOk++
+            // The first loads are master → variant → init/first segments; after
+            // that only the count matters, so the ring keeps room for errors.
+            if (diagLoadsOk <= MAX_LOGGED_LOADS) {
+                diag("load_ok ${loadLabel(loadEventInfo, mediaLoadData)} " +
+                    "${loadEventInfo.loadDurationMs}ms ${loadEventInfo.bytesLoaded}B")
+            }
+        }
+
+        override fun onLoadError(
+            eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo,
+            mediaLoadData: MediaLoadData,
+            error: IOException,
+            wasCanceled: Boolean
+        ) {
+            diagLoadsFailed++
+            diag("load_err ${loadLabel(loadEventInfo, mediaLoadData)} " +
+                "${loadEventInfo.loadDurationMs}ms ${describeThrowable(error)} canceled=$wasCanceled")
+        }
+
+        override fun onLoadCanceled(
+            eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo,
+            mediaLoadData: MediaLoadData
+        ) {
+            diag("load_cancel ${loadLabel(loadEventInfo, mediaLoadData)}")
+        }
+
+        override fun onTracksChanged(eventTime: AnalyticsListener.EventTime, tracks: Tracks) {
+            diag("tracks ${describeTracks(tracks)}")
+        }
+
+        override fun onVideoDecoderInitialized(
+            eventTime: AnalyticsListener.EventTime,
+            decoderName: String,
+            initializedTimestampMs: Long,
+            initializationDurationMs: Long
+        ) {
+            diagVideoDecoder = "$decoderName(${initializationDurationMs}ms)"
+            diagVideoDecoderAtMs = SystemClock.elapsedRealtime()
+            diag("vdec_init $decoderName ${initializationDurationMs}ms")
+        }
+
+        override fun onAudioDecoderInitialized(
+            eventTime: AnalyticsListener.EventTime,
+            decoderName: String,
+            initializedTimestampMs: Long,
+            initializationDurationMs: Long
+        ) {
+            diagAudioDecoder = "$decoderName(${initializationDurationMs}ms)"
+            diagAudioDecoderAtMs = SystemClock.elapsedRealtime()
+            diag("adec_init $decoderName ${initializationDurationMs}ms")
+        }
+
+        override fun onVideoDecoderReleased(eventTime: AnalyticsListener.EventTime, decoderName: String) {
+            diag("vdec_release $decoderName")
+        }
+
+        override fun onAudioDecoderReleased(eventTime: AnalyticsListener.EventTime, decoderName: String) {
+            diag("adec_release $decoderName")
+        }
+
+        override fun onVideoInputFormatChanged(
+            eventTime: AnalyticsListener.EventTime,
+            format: Format,
+            decoderReuseEvaluation: DecoderReuseEvaluation?
+        ) {
+            diag("vfmt ${describeFormat(format)}")
+        }
+
+        override fun onRenderedFirstFrame(
+            eventTime: AnalyticsListener.EventTime,
+            output: Any,
+            renderTimeMs: Long
+        ) {
+            diagFirstFrameAtMs = SystemClock.elapsedRealtime()
+            diag("first_frame")
+        }
+
+        override fun onVideoCodecError(eventTime: AnalyticsListener.EventTime, videoCodecError: Exception) {
+            diagCodecError = "video:${describeThrowable(videoCodecError)}"
+            diag("vcodec_err ${describeThrowable(videoCodecError)}")
+        }
+
+        override fun onAudioCodecError(eventTime: AnalyticsListener.EventTime, audioCodecError: Exception) {
+            diagCodecError = "audio:${describeThrowable(audioCodecError)}"
+            diag("acodec_err ${describeThrowable(audioCodecError)}")
+        }
+
+        override fun onAudioSinkError(eventTime: AnalyticsListener.EventTime, audioSinkError: Exception) {
+            diagCodecError = "sink:${describeThrowable(audioSinkError)}"
+            diag("asink_err ${describeThrowable(audioSinkError)}")
+        }
+
+        override fun onDroppedVideoFrames(
+            eventTime: AnalyticsListener.EventTime,
+            droppedFrames: Int,
+            elapsedMs: Long
+        ) {
+            diagDroppedFrames += droppedFrames
+            diag("dropped $droppedFrames/${elapsedMs}ms")
+        }
+
+        override fun onSurfaceSizeChanged(eventTime: AnalyticsListener.EventTime, width: Int, height: Int) {
+            // A plain Surface reports -1x-1 (size unknown); only a real size
+            // adds information over the attached/detached state.
+            if (width > 0 && height > 0) diagSurface = "attached ${width}x$height"
+            diag("surface ${width}x$height")
+        }
+
+        override fun onPlayerError(eventTime: AnalyticsListener.EventTime, error: PlaybackException) {
+            diag("player_error ${error.errorCodeName}")
+        }
+    }
+
+    // Logcat ABR trace (manifest ladder, cap, rung picks/switches, bandwidth).
+    // Debuggable builds only: the listener is never registered in release.
+    private val abrTraceEnabled =
+        (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+    private var abrLadderLogged = false
+    private var abrLastMediaPlaylist: String? = null
+    private var abrLastVideoFormat: Format? = null
+    private var abrLastBandwidthBps = 0L
+
+    private fun abr(message: String) {
+        Log.d(ABR_LOG_TAG, "ABR tex=${surfaceProducer.id()} $message")
+    }
+
+    private fun resetAbrTrace() {
+        abrLadderLogged = false
+        abrLastMediaPlaylist = null
+        abrLastVideoFormat = null
+        abrLastBandwidthBps = 0L
+    }
+
+    private val abrTraceListener = object : AnalyticsListener {
+        override fun onTimelineChanged(eventTime: AnalyticsListener.EventTime, reason: Int) {
+            val manifest = exoPlayer?.currentManifest as? HlsManifest ?: return
+            if (!abrLadderLogged) {
+                abrLadderLogged = true
+                logHlsLadder(manifest)
+            }
+            val media = manifest.mediaPlaylist
+            val key = "${fileName(media.baseUri.toUri())} target=${media.targetDurationUs / 1000}ms " +
+                "segs=${media.segments.size} dur=${media.durationUs / 1000}ms " +
+                "type=${media.playlistType} endTag=${media.hasEndTag}"
+            if (key != abrLastMediaPlaylist) {
+                abrLastMediaPlaylist = key
+                abr("media_playlist $key")
+            }
+        }
+
+        override fun onLoadCompleted(
+            eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo,
+            mediaLoadData: MediaLoadData
+        ) {
+            val label = "${loadLabel(loadEventInfo, mediaLoadData)} ${loadEventInfo.loadDurationMs}ms " +
+                "${loadEventInfo.bytesLoaded}B"
+            if (mediaLoadData.dataType == C.DATA_TYPE_MANIFEST) {
+                abr("manifest $label")
+            } else {
+                abr("seg $label rung=${rungLabel(mediaLoadData.trackFormat)} " +
+                    "reason=${selectionReasonName(mediaLoadData.trackSelectionReason)}")
+            }
+        }
+
+        override fun onTracksChanged(eventTime: AnalyticsListener.EventTime, tracks: Tracks) {
+            val params = trackSelector.parameters
+            tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }.forEach { group ->
+                val rungs = (0 until group.length).joinToString(" | ") { i ->
+                    val f = group.getTrackFormat(i)
+                    "$i:${rungLabel(f)} sup=${group.isTrackSupported(i)} " +
+                        "cap=${capVerdict(f, params)}${if (group.isTrackSelected(i)) " SELECTED" else ""}"
+                }
+                abr("tracks video[${group.length}] $rungs")
+            }
+        }
+
+        override fun onDownstreamFormatChanged(
+            eventTime: AnalyticsListener.EventTime,
+            mediaLoadData: MediaLoadData
+        ) {
+            val format = mediaLoadData.trackFormat ?: return
+            if (format.width <= 0 && mediaLoadData.trackType != C.TRACK_TYPE_VIDEO) return
+            abr("pick ${rungLabel(format)} reason=${selectionReasonName(mediaLoadData.trackSelectionReason)} " +
+                "bwEst=${bpsLabel(abrLastBandwidthBps)} cap=${capVerdict(format, trackSelector.parameters)}")
+        }
+
+        override fun onVideoInputFormatChanged(
+            eventTime: AnalyticsListener.EventTime,
+            format: Format,
+            decoderReuseEvaluation: DecoderReuseEvaluation?
+        ) {
+            val reuse = decoderReuseEvaluation?.let {
+                " decoderReuse=${it.result} discard=0x${Integer.toHexString(it.discardReasons)}"
+            } ?: " decoderReuse=new"
+            abr("switch ${rungLabel(abrLastVideoFormat)} -> ${rungLabel(format)}$reuse " +
+                "pos=${eventTime.currentPlaybackPositionMs}ms")
+            abrLastVideoFormat = format
+        }
+
+        override fun onBandwidthEstimate(
+            eventTime: AnalyticsListener.EventTime,
+            totalLoadTimeMs: Int,
+            totalBytesLoaded: Long,
+            bitrateEstimate: Long
+        ) {
+            abrLastBandwidthBps = bitrateEstimate
+            abr("bw est=${bpsLabel(bitrateEstimate)} sample=${totalBytesLoaded}B/${totalLoadTimeMs}ms")
+        }
+
+        override fun onVideoSizeChanged(eventTime: AnalyticsListener.EventTime, videoSize: VideoSize) {
+            abr("vsize ${videoSize.width}x${videoSize.height}")
+        }
+
+        override fun onDroppedVideoFrames(
+            eventTime: AnalyticsListener.EventTime,
+            droppedFrames: Int,
+            elapsedMs: Long
+        ) {
+            abr("dropped $droppedFrames/${elapsedMs}ms rung=${rungLabel(abrLastVideoFormat)}")
+        }
+    }
+
+    private fun logHlsLadder(manifest: HlsManifest) {
+        val playlist = manifest.multivariantPlaylist
+        val params = trackSelector.parameters
+        abr("ladder master=${fileName(playlist.baseUri.toUri())} rungs=${playlist.variants.size} " +
+            "audios=${playlist.audios.size} independentSegs=${playlist.hasIndependentSegments} " +
+            "cap=${params.maxVideoWidth}x${params.maxVideoHeight} maxBr=${bpsLabel(params.maxVideoBitrate.toLong())}")
+        playlist.variants.forEachIndexed { i, variant ->
+            val f = variant.format
+            abr("ladder [$i] ${f.width}x${f.height} avg=${bpsLabel(f.averageBitrate.toLong())} " +
+                "peak=${bpsLabel(f.peakBitrate.toLong())} codecs=${f.codecs} fps=${f.frameRate} " +
+                "file=${fileName(variant.url)} cap=${capVerdict(f, params)}")
+        }
+        playlist.audios.forEachIndexed { i, rendition ->
+            abr("ladder audio[$i] group=${rendition.groupId} name=${rendition.name} " +
+                "codecs=${rendition.format.codecs} lang=${rendition.format.language}")
+        }
+    }
+
+    private fun rungLabel(format: Format?): String {
+        if (format == null) return "none"
+        val size = if (format.width > 0) "${format.width}x${format.height}" else "?x?"
+        return "$size@${bpsLabel(format.bitrate.toLong())}"
+    }
+
+    // Mirrors DefaultTrackSelector's size/bitrate constraint check; when no rung
+    // passes, ExoPlayer still falls back to the lowest one.
+    private fun capVerdict(format: Format, params: DefaultTrackSelector.Parameters): String {
+        if (format.width > 0 && format.height > 0 &&
+            (format.width > params.maxVideoWidth || format.height > params.maxVideoHeight)
+        ) return "EXCLUDED(size)"
+        if (format.bitrate > 0 && format.bitrate > params.maxVideoBitrate) return "EXCLUDED(bitrate)"
+        return "ok"
+    }
+
+    private fun bpsLabel(bps: Long): String = when {
+        bps <= 0L -> "?"
+        bps >= Int.MAX_VALUE -> "none"
+        else -> "${bps / 1000}kbps"
+    }
+
+    private fun selectionReasonName(reason: Int): String = when (reason) {
+        C.SELECTION_REASON_INITIAL -> "initial"
+        C.SELECTION_REASON_MANUAL -> "manual"
+        C.SELECTION_REASON_ADAPTIVE -> "adaptive"
+        C.SELECTION_REASON_TRICK_PLAY -> "trick_play"
+        else -> "r$reason"
+    }
+
+    /** Player state plus the current source's event timeline. */
+    fun diagnosticsSnapshot(): String =
+        "${playerStateLine()} | recent=${diagEvents.joinToString(" ; ")}".take(MAX_ERROR_CHARS)
+
+    private fun playerStateLine(): String {
+        val p = exoPlayer ?: return "no_exoplayer"
+        return "state=${stateName(p.playbackState)} playWhenReady=${p.playWhenReady} " +
+            "suppressed=${p.playbackSuppressionReason} loading=${p.isLoading} " +
+            "nativeInit=$isInitialized pos=${p.currentPosition} buffered=${p.bufferedPosition} " +
+            "dur=${p.duration} vfmt=${describeFormat(p.videoFormat)} " +
+            "afmt=${describeFormat(p.audioFormat)} err=${p.playerError?.errorCodeName} " +
+            "loadsOk=$diagLoadsOk loadsFailed=$diagLoadsFailed " +
+            "sinceSource=${SystemClock.elapsedRealtime() - diagSourceSetAtMs}ms " +
+            "vdec=${diagVideoDecoder?.let { "$it@${since(diagVideoDecoderAtMs)}" } ?: "none"} " +
+            "adec=${diagAudioDecoder?.let { "$it@${since(diagAudioDecoderAtMs)}" } ?: "none"} " +
+            "firstFrame=${diagFirstFrameAtMs?.let { since(it) } ?: "none"} " +
+            "surface=${diagSurface ?: "none"} dropped=$diagDroppedFrames " +
+            "codecErr=${diagCodecError ?: "none"}"
+    }
+
+    private fun describeError(error: PlaybackException): String {
+        val out = StringBuilder("code=${error.errorCodeName}(${error.errorCode})")
+        if (error is ExoPlaybackException) {
+            out.append(" type=").append(
+                when (error.type) {
+                    ExoPlaybackException.TYPE_SOURCE -> "source"
+                    ExoPlaybackException.TYPE_RENDERER -> "renderer"
+                    ExoPlaybackException.TYPE_UNEXPECTED -> "unexpected"
+                    ExoPlaybackException.TYPE_REMOTE -> "remote"
+                    else -> "t${error.type}"
+                }
+            )
+            if (error.type == ExoPlaybackException.TYPE_RENDERER) {
+                out.append(" renderer=${error.rendererName} idx=${error.rendererIndex}")
+                out.append(" format=${describeFormat(error.rendererFormat)}")
+                out.append(" support=${C.getFormatSupportString(error.rendererFormatSupport)}")
+            }
+        }
+        var cause = error.cause
+        var depth = 0
+        while (cause != null && depth < MAX_CAUSE_DEPTH) {
+            out.append(" | cause$depth=").append(describeThrowable(cause))
+            cause = cause.cause
+            depth++
+        }
+        return out.toString()
+    }
+
+    // Labels survive R8 (class names do not), and never carry a URL's query or
+    // token-bearing path — only the file name.
+    private fun describeThrowable(t: Throwable): String {
+        val label = when (t) {
+            is HttpDataSource.InvalidResponseCodeException ->
+                "http_${t.responseCode} file=${fileName(t.dataSpec.uri)}"
+            is HttpDataSource.InvalidContentTypeException ->
+                "bad_content_type(${t.contentType}) file=${fileName(t.dataSpec.uri)}"
+            is HttpDataSource.HttpDataSourceException ->
+                "http_io(type=${t.type}) file=${fileName(t.dataSpec.uri)}"
+            is MediaCodecRenderer.DecoderInitializationException ->
+                "decoder_init mime=${t.mimeType} decoder=${t.codecInfo?.name} " +
+                    "secure=${t.secureDecoderRequired} diag=${t.diagnosticInfo}"
+            is ParserException ->
+                "parser malformed=${t.contentIsMalformed} dataType=${t.dataType}"
+            is java.net.UnknownHostException -> "unknown_host"
+            is java.net.SocketTimeoutException -> "socket_timeout"
+            is java.net.ConnectException -> "connect_failed"
+            is java.net.SocketException -> "socket"
+            is javax.net.ssl.SSLException -> "ssl"
+            is java.io.EOFException -> "eof"
+            else -> t.javaClass.simpleName
+        }
+        val message = t.message?.let { " msg=${redact(it)}" } ?: ""
+        return "$label$message"
+    }
+
+    private fun redact(text: String): String =
+        text.replace(Regex("https?://\\S+")) { match ->
+            "<url:${fileName(match.value.toUri())}>"
+        }.replace(Regex("hdn[a-z]+=[^\\s/]*"), "hdn*=<redacted>").take(MAX_MESSAGE_CHARS)
+
+    private fun fileName(uri: Uri?): String =
+        uri?.lastPathSegment?.take(MAX_FILE_NAME_CHARS) ?: "none"
+
+    private fun loadLabel(info: LoadEventInfo, data: MediaLoadData): String {
+        val dataType = when (data.dataType) {
+            C.DATA_TYPE_MANIFEST -> "manifest"
+            C.DATA_TYPE_MEDIA -> "media"
+            C.DATA_TYPE_MEDIA_INITIALIZATION -> "init"
+            C.DATA_TYPE_DRM -> "drm"
+            else -> "dt${data.dataType}"
+        }
+        return "$dataType/${trackTypeName(data.trackType)} ${fileName(info.uri)}"
+    }
+
+    private fun describeTracks(tracks: Tracks): String {
+        if (tracks.groups.isEmpty()) return "none"
+        return tracks.groups.joinToString(",") { group ->
+            val selected = (0 until group.length).firstOrNull { group.isTrackSelected(it) }
+            val picked = selected?.let { describeFormat(group.getTrackFormat(it)) } ?: "unselected"
+            "${trackTypeName(group.type)}[${group.length} supported=${group.isSupported}]=$picked"
+        }
+    }
+
+    private fun describeFormat(format: Format?): String {
+        if (format == null) return "null"
+        val mime = format.sampleMimeType ?: format.containerMimeType ?: "?"
+        val size = if (format.width > 0) " ${format.width}x${format.height}" else ""
+        val codecs = format.codecs?.let { " $it" } ?: ""
+        return "$mime$codecs$size ${format.bitrate}bps"
+    }
+
+    private fun trackTypeName(type: Int): String = when (type) {
+        C.TRACK_TYPE_VIDEO -> "video"
+        C.TRACK_TYPE_AUDIO -> "audio"
+        C.TRACK_TYPE_TEXT -> "text"
+        C.TRACK_TYPE_DEFAULT -> "muxed"
+        C.TRACK_TYPE_IMAGE -> "image"
+        else -> "type$type"
+    }
+
+    private fun stateName(state: Int): String = when (state) {
+        Player.STATE_IDLE -> "IDLE"
+        Player.STATE_BUFFERING -> "BUFFERING"
+        Player.STATE_READY -> "READY"
+        Player.STATE_ENDED -> "ENDED"
+        else -> "S$state"
+    }
 
     init {
         val loadBuilder = DefaultLoadControl.Builder()
@@ -150,6 +615,10 @@ internal class BetterPlayer(
     ) {
         this.key = key
         isInitialized = false
+        resetDiagnostics()
+        resetAbrTrace()
+        diag("setDataSource hint=${formatHint ?: "auto"} drm=${!licenseUrl.isNullOrEmpty()} " +
+            "clearKey=${!clearKey.isNullOrEmpty()} cache=$useCache file=${fileName(dataSource?.toUri())}")
         val uri = dataSource?.toUri()
         var dataSourceFactory: DataSource.Factory?
         val userAgent = getUserAgent(headers)
@@ -202,6 +671,14 @@ internal class BetterPlayer(
             dataSourceFactory = DefaultDataSource.Factory(context)
         }
         val mediaSource = buildMediaSource(uri, dataSourceFactory, formatHint, cacheKey, context)
+        // A pooled player is re-sourced across unrelated streams. Without a stop
+        // the previous stream's decoder is reconfigured and reused, and on Pixel
+        // 10a (c2.exynos.h264.decoder, 854x480 → 1280x720) it then emits no frame
+        // and no error: stuck in BUFFERING with 10s buffered. stop() resets the
+        // renderers (foreground mode is off), so each source gets fresh decoders;
+        // ABR switches within one stream still reuse them.
+        diag("stop_for_new_source")
+        exoPlayer?.stop()
         if (overriddenDuration != 0L) {
             val clippingMediaSource = ClippingMediaSource.Builder(mediaSource)
                 .setStartPositionMs(0)
@@ -472,15 +949,22 @@ internal class BetterPlayer(
         // external texture", ~1/s) and flashed garbage on repaint on some
         // devices. The producer owns the Surface; on lifecycle teardown it
         // must be re-fetched, not recreated by us.
+        // Before the first setVideoSurface so no decoder/surface event is missed.
+        exoPlayer?.addAnalyticsListener(diagnosticsListener)
         surfaceProducer.setCallback(object : SurfaceProducer.Callback {
             override fun onSurfaceAvailable() {
+                diagSurface = "attached"
+                diag("surface_available")
                 exoPlayer?.setVideoSurface(surfaceProducer.surface)
             }
 
             override fun onSurfaceCleanup() {
+                diagSurface = "detached"
+                diag("surface_cleanup")
                 exoPlayer?.setVideoSurface(null)
             }
         })
+        diagSurface = "attached"
         exoPlayer?.setVideoSurface(surfaceProducer.surface)
         setAudioAttributes(exoPlayer, true)
         exoPlayer?.addListener(object : Player.Listener {
@@ -517,38 +1001,14 @@ internal class BetterPlayer(
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                // Forward the media3 errorCode and the full cause chain —
-                // "$error" alone drops both, making decoder-init failures
-                // (resource exhaustion), runtime codec deaths and our own
-                // lifecycle races (IllegalStateException) indistinguishable
-                // in video_error analytics.
-                val details = StringBuilder()
-                    .append(error.errorCodeName)
-                    .append('(').append(error.errorCode).append("): ")
-                    .append(error.message)
-                var cause: Throwable? = error.cause
-                var depth = 0
-                while (cause != null && depth < 5) {
-                    details.append(" <- ")
-                        .append(cause.javaClass.simpleName)
-                        .append(": ").append(cause.message)
-                    when (cause) {
-                        is MediaCodecRenderer.DecoderInitializationException ->
-                            details.append(" [codec=").append(cause.codecInfo?.name)
-                                .append(" diag=").append(cause.diagnosticInfo)
-                                .append(']')
-                        is MediaCodec.CodecException ->
-                            details.append(" [diag=").append(cause.diagnosticInfo)
-                                .append(" recoverable=").append(cause.isRecoverable)
-                                .append(" transient=").append(cause.isTransient)
-                                .append(']')
-                    }
-                    cause = cause.cause
-                    depth++
-                }
-                eventSink.error("VideoError", details.toString(), "")
+                // `$error` alone is "<obfuscated class>: Source error" in release;
+                // the error code and cause chain are what say WHY.
+                val message = "Video player had error $error | ${describeError(error)} | " +
+                    "${playerStateLine()} | recent=${diagEvents.joinToString(" ; ")}"
+                eventSink.error("VideoError", message.take(MAX_ERROR_CHARS), "")
             }
         })
+        if (abrTraceEnabled) exoPlayer?.addAnalyticsListener(abrTraceListener)
         val reply: MutableMap<String, Any> = HashMap()
         reply["textureId"] = surfaceProducer.id()
         result.success(reply)
@@ -614,6 +1074,12 @@ internal class BetterPlayer(
             parametersBuilder.setMaxVideoBitrate(Int.MAX_VALUE)
         }
         trackSelector.setParameters(parametersBuilder)
+        if (abrTraceEnabled) {
+            val p = trackSelector.parameters
+            val kind = if (width == 0 && height == 0 && bitrate == 0) "cap_cleared" else "cap_set"
+            abr("$kind req=${width}x$height br=$bitrate -> max=${p.maxVideoWidth}x${p.maxVideoHeight} " +
+                "maxBr=${bpsLabel(p.maxVideoBitrate.toLong())}")
+        }
     }
 
     fun seekTo(location: Int) {
@@ -830,12 +1296,19 @@ internal class BetterPlayer(
 
     companion object {
         private const val TAG = "BetterPlayer"
+        private const val ABR_LOG_TAG = "ALRIGHT_TAG"
         private const val FORMAT_SS = "ss"
         private const val FORMAT_DASH = "dash"
         private const val FORMAT_HLS = "hls"
         private const val FORMAT_OTHER = "other"
         private const val DEFAULT_NOTIFICATION_CHANNEL = "BETTER_PLAYER_NOTIFICATION"
         private const val NOTIFICATION_ID = 20772077
+        private const val MAX_DIAG_EVENTS = 30
+        private const val MAX_LOGGED_LOADS = 8
+        private const val MAX_CAUSE_DEPTH = 4
+        private const val MAX_ERROR_CHARS = 2500
+        private const val MAX_MESSAGE_CHARS = 160
+        private const val MAX_FILE_NAME_CHARS = 80
 
         //Clear cache without accessing BetterPlayerCache.
         fun clearCache(context: Context?, result: MethodChannel.Result) {
