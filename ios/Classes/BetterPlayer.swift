@@ -49,6 +49,10 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     // observers must not restart playback before the seek completes.
     private var pendingSeeks = 0
     private var peakBitRate: Double = 0
+    // Last variant reported to Dart as "qualityChanged"; KVO and access-log
+    // notifications both re-fire for the same variant.
+    private var lastQualitySize: CGSize = .zero
+    private var lastQualityBitrate: Int = 0
 
     private var pipController: AVPictureInPictureController?
     private var restoreUIOnPipStop: ((Bool) -> Void)?
@@ -118,6 +122,9 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
             item.addObserver(self, forKeyPath: "playbackBufferEmpty", options: [], context: &playbackBufferEmptyContext)
             item.addObserver(self, forKeyPath: "playbackBufferFull", options: [], context: &playbackBufferFullContext)
             NotificationCenter.default.addObserver(self, selector: #selector(itemDidPlayToEndTime(_:)), name: .AVPlayerItemDidPlayToEndTime, object: item)
+            // A new access-log entry is logged on every HLS variant switch, which
+            // also covers same-resolution bitrate switches presentationSize misses.
+            NotificationCenter.default.addObserver(self, selector: #selector(itemNewAccessLogEntry(_:)), name: .AVPlayerItemNewAccessLogEntry, object: item)
             observersAdded = true
         }
     }
@@ -134,6 +141,27 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
             NotificationCenter.default.removeObserver(self)
             observersAdded = false
         }
+    }
+
+    @objc private func itemNewAccessLogEntry(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.emitQualityIfChanged() }
+    }
+
+    // Reports the variant currently being played (ABR or capped) to Dart.
+    private func emitQualityIfChanged() {
+        guard let eventSink = eventSink, let item = player.currentItem else { return }
+        let size = item.presentationSize
+        guard size.width > 0, size.height > 0 else { return }
+        let indicated = item.accessLog()?.events.last?.indicatedBitrate ?? 0
+        let bitrate = indicated > 0 ? Int(indicated) : 0
+        if size == lastQualitySize && bitrate == lastQualityBitrate { return }
+        lastQualitySize = size
+        lastQualityBitrate = bitrate
+        eventSink(["event": "qualityChanged",
+                   "width": NSNumber(value: Int(size.width)),
+                   "height": NSNumber(value: Int(size.height)),
+                   "bitrate": NSNumber(value: bitrate),
+                   "key": key as Any])
     }
 
     @objc private func itemDidPlayToEndTime(_ notification: Notification) {
@@ -249,6 +277,8 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         }
         applyTrackCap(item)
         pendingSeeks = 0
+        lastQualitySize = .zero
+        lastQualityBitrate = 0
         gateLog("new item cap=\(Int(maxResolution.width))x\(Int(maxResolution.height)) bitrate=\(Int(peakBitRate))")
         player.replaceCurrentItem(with: item)
 
@@ -377,6 +407,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
             }
         } else if context == &presentationSizeContext {
             onReadyToPlay()
+            emitQualityIfChanged()
         } else if context == &statusContext {
             if let item = object as? AVPlayerItem {
                 switch item.status {

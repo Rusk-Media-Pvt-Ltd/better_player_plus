@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:better_player_plus/better_player_plus.dart';
 import 'package:better_player_plus/src/configuration/better_player_controller_event.dart';
@@ -1128,6 +1129,21 @@ class BetterPlayerController {
         );
       case VideoEventType.bufferingEnd:
         _postEvent(BetterPlayerEvent(BetterPlayerEventType.bufferingEnd));
+      case VideoEventType.qualityChanged:
+        final Size size = event.size ?? Size.zero;
+        // Shorter side, so portrait 720x1280 is "720p" like landscape 1280x720.
+        final int lines = min(size.width, size.height).round();
+        _postEvent(
+          BetterPlayerEvent(
+            BetterPlayerEventType.qualityChanged,
+            parameters: <String, dynamic>{
+              'width': size.width.round(),
+              'height': size.height.round(),
+              'bitrate': event.bitrate ?? 0,
+              'quality': '${lines}p',
+            },
+          ),
+        );
       default:
         break;
     }
