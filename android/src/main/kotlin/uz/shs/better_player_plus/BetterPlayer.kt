@@ -72,6 +72,7 @@ import androidx.media3.exoplayer.source.ClippingMediaSource
 import androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import android.os.SystemClock
 import androidx.media3.common.Format
@@ -103,14 +104,19 @@ internal class BetterPlayer(
 ) {
     private val exoPlayer: ExoPlayer?
     private val eventSink = QueuingEventSink()
+    // Stock ABR only steps quality UP once >=10s is buffered at chunk-pick time.
+    // The app's pooled feed players run 3-6s LoadControls and pick at ~1.4s
+    // buffered, so after one bandwidth dip they could never climb back (device
+    // ABR trace, 2026-10-23). Only the first argument deviates from media3's
+    // defaults; the 0.7 bandwidth fraction still gates every up-switch.
     private val trackSelector: DefaultTrackSelector = DefaultTrackSelector(
         context,
         AdaptiveTrackSelection.Factory(
-            /* minDurationForQualityIncreaseMs = */ 5000,
-            /* maxDurationForQualityDecreaseMs = */ 25000,
-            /* minDurationToRetainAfterDiscardMs = */ 25000,
-            /* bandwidthFraction = */ 0.7f,
-        ),
+            MIN_DURATION_FOR_QUALITY_INCREASE_MS,
+            AdaptiveTrackSelection.DEFAULT_MAX_DURATION_FOR_QUALITY_DECREASE_MS,
+            AdaptiveTrackSelection.DEFAULT_MIN_DURATION_TO_RETAIN_AFTER_DISCARD_MS,
+            AdaptiveTrackSelection.DEFAULT_BANDWIDTH_FRACTION
+        )
     )
     private val loadControl: LoadControl
     private var isInitialized = false
@@ -148,6 +154,15 @@ internal class BetterPlayer(
     private var diagDroppedFrames = 0
     private var diagCodecError: String? = null
 
+    // Position (ms) of the last in-place codec recovery, -1 if none this source.
+    // A codec released mid-render (release-race), reclaimed by the OS, or hit by
+    // a transient runtime check recovers via a fresh prepare() from here, instead
+    // of hard-failing and stranding the user mid-episode. A fresh recovery is
+    // allowed only once playback has advanced past the last one by
+    // RECOVERY_MIN_PROGRESS_MS: a repeat error at the SAME position is a genuinely
+    // stuck stream (must fail, no loop), while errors minutes apart each recover.
+    private var lastRecoveryPositionMs = -1L
+
     private fun resetDiagnostics() {
         diagEvents.clear()
         diagSourceSetAtMs = SystemClock.elapsedRealtime()
@@ -156,6 +171,7 @@ internal class BetterPlayer(
         diagFirstFrameAtMs = null
         diagDroppedFrames = 0
         diagCodecError = null
+        lastRecoveryPositionMs = -1L
     }
 
     private fun since(atMs: Long): String =
@@ -1043,6 +1059,39 @@ internal class BetterPlayer(
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                // Recoverable codec errors — a decoder released mid-render
+                // (releaseOutputBuffer at Released state), reclaimed by the OS
+                // (4006), or a transient runtime check (CodecException) — are
+                // rebuilt in place with a fresh prepare() from the same position
+                // instead of killing playback. A fresh recovery is allowed only
+                // after playback advanced past the last one (see below), so a
+                // stream stuck at one position still fails instead of looping.
+                val recoverable =
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_RESOURCES_RECLAIMED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_FAILED_RUNTIME_CHECK
+                val player = exoPlayer
+                if (player != null) {
+                    val resumeMs = player.currentPosition
+                    val advancedSinceLast = lastRecoveryPositionMs < 0 ||
+                        resumeMs > lastRecoveryPositionMs + RECOVERY_MIN_PROGRESS_MS
+                    if (recoverable && advancedSinceLast) {
+                        lastRecoveryPositionMs = resumeMs
+                        diag("codec_recover ${error.errorCodeName} @${resumeMs}ms")
+                        // Non-fatal signal: Dart counts this as a silent recovery
+                        // (video_codec_recovered), not a video_error. Lets the
+                        // dashboard see saves the user never noticed.
+                        val recovered: MutableMap<String, Any?> = HashMap()
+                        recovered["event"] = "codecRecovered"
+                        recovered["key"] = key
+                        recovered["code"] = error.errorCodeName
+                        recovered["position"] = resumeMs
+                        eventSink.success(recovered)
+                        player.prepare()
+                        if (resumeMs > 0) player.seekTo(resumeMs)
+                        return
+                    }
+                }
                 // `$error` alone is "<obfuscated class>: Source error" in release;
                 // the error code and cause chain are what say WHY.
                 val message = "Video player had error $error | ${describeError(error)} | " +
@@ -1051,7 +1100,10 @@ internal class BetterPlayer(
             }
         })
         exoPlayer?.addAnalyticsListener(qualityListener)
-        if (abrTraceEnabled) exoPlayer?.addAnalyticsListener(abrTraceListener)
+        if (abrTraceEnabled) {
+            exoPlayer?.addAnalyticsListener(abrTraceListener)
+            abr("abr_cfg minDurationForQualityIncrease=${MIN_DURATION_FOR_QUALITY_INCREASE_MS}ms")
+        }
         val reply: MutableMap<String, Any> = HashMap()
         reply["textureId"] = surfaceProducer.id()
         result.success(reply)
@@ -1340,6 +1392,7 @@ internal class BetterPlayer(
     companion object {
         private const val TAG = "BetterPlayer"
         private const val ABR_LOG_TAG = "ALRIGHT_TAG"
+        private const val MIN_DURATION_FOR_QUALITY_INCREASE_MS = 1250
         private const val FORMAT_SS = "ss"
         private const val FORMAT_DASH = "dash"
         private const val FORMAT_HLS = "hls"
@@ -1349,6 +1402,10 @@ internal class BetterPlayer(
         private const val MAX_DIAG_EVENTS = 30
         private const val MAX_LOGGED_LOADS = 8
         private const val MAX_CAUSE_DEPTH = 4
+        // Playback must advance this far past the last in-place codec recovery
+        // before another is allowed — a repeat error within this window is a
+        // stuck stream and must fail, not loop.
+        private const val RECOVERY_MIN_PROGRESS_MS = 10_000L
         private const val MAX_ERROR_CHARS = 2500
         private const val MAX_MESSAGE_CHARS = 160
         private const val MAX_FILE_NAME_CHARS = 80
