@@ -71,6 +71,7 @@ import androidx.media3.exoplayer.smoothstreaming.SsMediaSource
 import androidx.media3.exoplayer.source.ClippingMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import android.os.SystemClock
 import androidx.media3.common.Format
@@ -102,7 +103,20 @@ internal class BetterPlayer(
 ) {
     private val exoPlayer: ExoPlayer?
     private val eventSink = QueuingEventSink()
-    private val trackSelector: DefaultTrackSelector = DefaultTrackSelector(context)
+    // Stock ABR only steps quality UP once >=10s is buffered at chunk-pick time.
+    // The app's pooled feed players run 3-6s LoadControls and pick at ~1.4s
+    // buffered, so after one bandwidth dip they could never climb back (device
+    // ABR trace, 2026-10-23). Only the first argument deviates from media3's
+    // defaults; the 0.7 bandwidth fraction still gates every up-switch.
+    private val trackSelector: DefaultTrackSelector = DefaultTrackSelector(
+        context,
+        AdaptiveTrackSelection.Factory(
+            MIN_DURATION_FOR_QUALITY_INCREASE_MS,
+            AdaptiveTrackSelection.DEFAULT_MAX_DURATION_FOR_QUALITY_DECREASE_MS,
+            AdaptiveTrackSelection.DEFAULT_MIN_DURATION_TO_RETAIN_AFTER_DISCARD_MS,
+            AdaptiveTrackSelection.DEFAULT_BANDWIDTH_FRACTION
+        )
+    )
     private val loadControl: LoadControl
     private var isInitialized = false
     private var key: String? = null
@@ -1050,7 +1064,10 @@ internal class BetterPlayer(
                 eventSink.error("VideoError", message.take(MAX_ERROR_CHARS), "")
             }
         })
-        if (abrTraceEnabled) exoPlayer?.addAnalyticsListener(abrTraceListener)
+        if (abrTraceEnabled) {
+            exoPlayer?.addAnalyticsListener(abrTraceListener)
+            abr("abr_cfg minDurationForQualityIncrease=${MIN_DURATION_FOR_QUALITY_INCREASE_MS}ms")
+        }
         val reply: MutableMap<String, Any> = HashMap()
         reply["textureId"] = surfaceProducer.id()
         result.success(reply)
@@ -1339,6 +1356,7 @@ internal class BetterPlayer(
     companion object {
         private const val TAG = "BetterPlayer"
         private const val ABR_LOG_TAG = "ALRIGHT_TAG"
+        private const val MIN_DURATION_FOR_QUALITY_INCREASE_MS = 1250
         private const val FORMAT_SS = "ss"
         private const val FORMAT_DASH = "dash"
         private const val FORMAT_HLS = "hls"
