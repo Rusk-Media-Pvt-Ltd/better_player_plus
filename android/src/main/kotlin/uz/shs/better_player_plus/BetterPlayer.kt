@@ -139,6 +139,15 @@ internal class BetterPlayer(
     private var diagDroppedFrames = 0
     private var diagCodecError: String? = null
 
+    // Position (ms) of the last in-place codec recovery, -1 if none this source.
+    // A codec released mid-render (release-race), reclaimed by the OS, or hit by
+    // a transient runtime check recovers via a fresh prepare() from here, instead
+    // of hard-failing and stranding the user mid-episode. A fresh recovery is
+    // allowed only once playback has advanced past the last one by
+    // RECOVERY_MIN_PROGRESS_MS: a repeat error at the SAME position is a genuinely
+    // stuck stream (must fail, no loop), while errors minutes apart each recover.
+    private var lastRecoveryPositionMs = -1L
+
     private fun resetDiagnostics() {
         diagEvents.clear()
         diagSourceSetAtMs = SystemClock.elapsedRealtime()
@@ -147,6 +156,7 @@ internal class BetterPlayer(
         diagFirstFrameAtMs = null
         diagDroppedFrames = 0
         diagCodecError = null
+        lastRecoveryPositionMs = -1L
     }
 
     private fun since(atMs: Long): String =
@@ -1000,6 +1010,39 @@ internal class BetterPlayer(
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                // Recoverable codec errors — a decoder released mid-render
+                // (releaseOutputBuffer at Released state), reclaimed by the OS
+                // (4006), or a transient runtime check (CodecException) — are
+                // rebuilt in place with a fresh prepare() from the same position
+                // instead of killing playback. A fresh recovery is allowed only
+                // after playback advanced past the last one (see below), so a
+                // stream stuck at one position still fails instead of looping.
+                val recoverable =
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_RESOURCES_RECLAIMED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_FAILED_RUNTIME_CHECK
+                val player = exoPlayer
+                if (player != null) {
+                    val resumeMs = player.currentPosition
+                    val advancedSinceLast = lastRecoveryPositionMs < 0 ||
+                        resumeMs > lastRecoveryPositionMs + RECOVERY_MIN_PROGRESS_MS
+                    if (recoverable && advancedSinceLast) {
+                        lastRecoveryPositionMs = resumeMs
+                        diag("codec_recover ${error.errorCodeName} @${resumeMs}ms")
+                        // Non-fatal signal: Dart counts this as a silent recovery
+                        // (video_codec_recovered), not a video_error. Lets the
+                        // dashboard see saves the user never noticed.
+                        val recovered: MutableMap<String, Any?> = HashMap()
+                        recovered["event"] = "codecRecovered"
+                        recovered["key"] = key
+                        recovered["code"] = error.errorCodeName
+                        recovered["position"] = resumeMs
+                        eventSink.success(recovered)
+                        player.prepare()
+                        if (resumeMs > 0) player.seekTo(resumeMs)
+                        return
+                    }
+                }
                 // `$error` alone is "<obfuscated class>: Source error" in release;
                 // the error code and cause chain are what say WHY.
                 val message = "Video player had error $error | ${describeError(error)} | " +
@@ -1305,6 +1348,10 @@ internal class BetterPlayer(
         private const val MAX_DIAG_EVENTS = 30
         private const val MAX_LOGGED_LOADS = 8
         private const val MAX_CAUSE_DEPTH = 4
+        // Playback must advance this far past the last in-place codec recovery
+        // before another is allowed — a repeat error within this window is a
+        // stuck stream and must fail, not loop.
+        private const val RECOVERY_MIN_PROGRESS_MS = 10_000L
         private const val MAX_ERROR_CHARS = 2500
         private const val MAX_MESSAGE_CHARS = 160
         private const val MAX_FILE_NAME_CHARS = 80
