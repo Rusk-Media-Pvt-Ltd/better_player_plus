@@ -69,6 +69,7 @@ import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.smoothstreaming.DefaultSsChunkSource
 import androidx.media3.exoplayer.smoothstreaming.SsMediaSource
 import androidx.media3.exoplayer.source.ClippingMediaSource
+import androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
@@ -102,7 +103,15 @@ internal class BetterPlayer(
 ) {
     private val exoPlayer: ExoPlayer?
     private val eventSink = QueuingEventSink()
-    private val trackSelector: DefaultTrackSelector = DefaultTrackSelector(context)
+    private val trackSelector: DefaultTrackSelector = DefaultTrackSelector(
+        context,
+        AdaptiveTrackSelection.Factory(
+            /* minDurationForQualityIncreaseMs = */ 5000,
+            /* maxDurationForQualityDecreaseMs = */ 25000,
+            /* minDurationToRetainAfterDiscardMs = */ 25000,
+            /* bandwidthFraction = */ 0.7f,
+        ),
+    )
     private val loadControl: LoadControl
     private var isInitialized = false
     private var key: String? = null
@@ -301,6 +310,37 @@ internal class BetterPlayer(
         abrLastMediaPlaylist = null
         abrLastVideoFormat = null
         abrLastBandwidthBps = 0L
+    }
+
+    // Last rung reported to Dart; decoder re-inits (seek, surface swap) re-fire
+    // onVideoInputFormatChanged with the same format and must not re-emit.
+    private var lastQualityWidth = 0
+    private var lastQualityHeight = 0
+    private var lastQualityBitrate = 0
+
+    // Input format = the rung the decoder is fed now, i.e. what is on screen
+    // shortly; onDownstreamFormatChanged would fire a buffer-length too early.
+    private val qualityListener = object : AnalyticsListener {
+        override fun onVideoInputFormatChanged(
+            eventTime: AnalyticsListener.EventTime,
+            format: Format,
+            decoderReuseEvaluation: DecoderReuseEvaluation?
+        ) {
+            if (format.width <= 0 || format.height <= 0) return
+            if (format.width == lastQualityWidth && format.height == lastQualityHeight &&
+                format.bitrate == lastQualityBitrate
+            ) return
+            lastQualityWidth = format.width
+            lastQualityHeight = format.height
+            lastQualityBitrate = format.bitrate
+            val event: MutableMap<String, Any?> = HashMap()
+            event["event"] = "qualityChanged"
+            event["width"] = format.width
+            event["height"] = format.height
+            event["bitrate"] = if (format.bitrate == Format.NO_VALUE) 0 else format.bitrate
+            event["key"] = key
+            eventSink.success(event)
+        }
     }
 
     private val abrTraceListener = object : AnalyticsListener {
@@ -616,6 +656,9 @@ internal class BetterPlayer(
         isInitialized = false
         resetDiagnostics()
         resetAbrTrace()
+        lastQualityWidth = 0
+        lastQualityHeight = 0
+        lastQualityBitrate = 0
         diag("setDataSource hint=${formatHint ?: "auto"} drm=${!licenseUrl.isNullOrEmpty()} " +
             "clearKey=${!clearKey.isNullOrEmpty()} cache=$useCache file=${fileName(dataSource?.toUri())}")
         val uri = dataSource?.toUri()
@@ -1007,6 +1050,7 @@ internal class BetterPlayer(
                 eventSink.error("VideoError", message.take(MAX_ERROR_CHARS), "")
             }
         })
+        exoPlayer?.addAnalyticsListener(qualityListener)
         if (abrTraceEnabled) exoPlayer?.addAnalyticsListener(abrTraceListener)
         val reply: MutableMap<String, Any> = HashMap()
         reply["textureId"] = surfaceProducer.id()

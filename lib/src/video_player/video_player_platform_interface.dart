@@ -378,6 +378,7 @@ class VideoEvent {
     this.size,
     this.buffered,
     this.position,
+    this.bitrate,
   });
 
   /// The type of the event.
@@ -406,6 +407,12 @@ class VideoEvent {
   ///Seek position
   final Duration? position;
 
+  /// Bitrate (bits/s) of the rendition now playing, 0 if unknown.
+  ///
+  /// Only used if [eventType] is [VideoEventType.qualityChanged], together
+  /// with [size].
+  final int? bitrate;
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
@@ -415,6 +422,7 @@ class VideoEvent {
           eventType == other.eventType &&
           duration == other.duration &&
           size == other.size &&
+          bitrate == other.bitrate &&
           listEquals(buffered, other.buffered);
 
   @override
@@ -455,6 +463,9 @@ enum VideoEventType {
 
   /// Picture in picture mode has been dismissed
   pipStop,
+
+  /// The playing rendition changed (adaptive streaming switched quality).
+  qualityChanged,
 
   /// An unknown event has been received.
   unknown,

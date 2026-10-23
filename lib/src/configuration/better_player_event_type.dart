@@ -25,4 +25,9 @@ enum BetterPlayerEventType {
   bufferingUpdate,
   bufferingEnd,
   changedPlaylistItem,
+
+  /// Playing rendition changed, e.g. adaptive streaming moved 720p -> 360p
+  /// on a slow network. Parameters: `width`, `height`, `bitrate` (bits/s, 0 if
+  /// unknown) and `quality` (label like "720p").
+  qualityChanged,
 }

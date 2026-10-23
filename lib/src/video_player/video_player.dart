@@ -33,6 +33,8 @@ class VideoPlayerValue {
     this.speed = 1.0,
     this.errorDescription,
     this.isPip = false,
+    this.playingSize,
+    this.playingBitrate,
   });
 
   /// Returns an instance with a `null` [Duration].
@@ -86,6 +88,27 @@ class VideoPlayerValue {
   ///Is in Picture in Picture Mode
   final bool isPip;
 
+  /// Size of the rendition being played RIGHT NOW. Unlike [size] (fixed at
+  /// initialization), this follows every adaptive-streaming switch.
+  ///
+  /// Null until the first frames are decoded, and again after a new data
+  /// source is set.
+  final Size? playingSize;
+
+  /// Bitrate (bits/s) of the rendition being played right now; null or 0 when
+  /// unknown. See [playingSize].
+  final int? playingBitrate;
+
+  /// [playingSize] as a quality label like "720p" — the shorter side, so
+  /// portrait 720x1280 reads the same as landscape 1280x720. Null when unknown.
+  String? get playingQuality {
+    final s = playingSize;
+    if (s == null || s.width <= 0 || s.height <= 0) {
+      return null;
+    }
+    return '${(s.width < s.height ? s.width : s.height).round()}p';
+  }
+
   /// Indicates whether or not the video has been loaded and is ready to play.
   bool get initialized => duration != null;
 
@@ -121,6 +144,8 @@ class VideoPlayerValue {
     String? errorDescription,
     double? speed,
     bool? isPip,
+    Size? playingSize,
+    int? playingBitrate,
   }) => VideoPlayerValue(
     duration: duration ?? this.duration,
     size: size ?? this.size,
@@ -134,6 +159,8 @@ class VideoPlayerValue {
     speed: speed ?? this.speed,
     errorDescription: errorDescription ?? this.errorDescription,
     isPip: isPip ?? this.isPip,
+    playingSize: playingSize ?? this.playingSize,
+    playingBitrate: playingBitrate ?? this.playingBitrate,
   );
 
   @override
@@ -148,7 +175,9 @@ class VideoPlayerValue {
       'isLooping: $isLooping, '
       'isBuffering: $isBuffering, '
       'volume: $volume, '
-      'errorDescription: $errorDescription)';
+      'errorDescription: $errorDescription, '
+      'playingSize: $playingSize, '
+      'playingBitrate: $playingBitrate)';
 }
 
 /// Controls a platform video player, and provides updates when the state is
@@ -231,6 +260,8 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
           value = value.copyWith(isPip: true);
         case VideoEventType.pipStop:
           value = value.copyWith(isPip: false);
+        case VideoEventType.qualityChanged:
+          value = value.copyWith(playingSize: event.size, playingBitrate: event.bitrate);
         case VideoEventType.unknown:
           break;
       }
