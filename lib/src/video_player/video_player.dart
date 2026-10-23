@@ -207,7 +207,12 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
       switch (event.eventType) {
         case VideoEventType.initialized:
           value = value.copyWith(duration: event.duration, size: event.size);
-          _initializingCompleter.complete(null);
+          // Native can report initialized twice for one source (re-prepare
+          // after a decoder fallback), or after errorListener already failed
+          // the completer — guarded like that path, so _applyPlayPause runs.
+          if (!_initializingCompleter.isCompleted) {
+            _initializingCompleter.complete(null);
+          }
           _applyPlayPause();
         case VideoEventType.completed:
           value = value.copyWith(isPlaying: false, position: value.duration);
@@ -647,7 +652,7 @@ class VideoPlayer extends StatefulWidget {
 class _VideoPlayerState extends State<VideoPlayer> {
   _VideoPlayerState() {
     _listener = () {
-      final int? newTextureId = widget.controller!.textureId;
+      final int? newTextureId = widget.controller?.textureId;
       if (newTextureId != _textureId) {
         setState(() {
           _textureId = newTextureId;
@@ -659,27 +664,30 @@ class _VideoPlayerState extends State<VideoPlayer> {
   late VoidCallback _listener;
   int? _textureId;
 
+  // controller is nullable: BetterPlayer can build this widget before
+  // setupDataSource creates the inner player. A null controller renders the
+  // empty Container below instead of throwing a null check in initState.
   @override
   void initState() {
     super.initState();
-    _textureId = widget.controller!.textureId;
+    _textureId = widget.controller?.textureId;
     // Need to listen for initialization events since the actual texture ID
     // becomes available after asynchronous initialization finishes.
-    widget.controller!.addListener(_listener);
+    widget.controller?.addListener(_listener);
   }
 
   @override
   void didUpdateWidget(VideoPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    oldWidget.controller!.removeListener(_listener);
-    _textureId = widget.controller!.textureId;
-    widget.controller!.addListener(_listener);
+    oldWidget.controller?.removeListener(_listener);
+    _textureId = widget.controller?.textureId;
+    widget.controller?.addListener(_listener);
   }
 
   @override
   void deactivate() {
     super.deactivate();
-    widget.controller!.removeListener(_listener);
+    widget.controller?.removeListener(_listener);
   }
 
   @override
