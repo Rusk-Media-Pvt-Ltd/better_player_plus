@@ -210,13 +210,13 @@ extension SwiftBetterPlayerPlugin {
         }
         if call.method == "create" {
             let player = BetterPlayer(frame: .zero)
-            // BetterPlayerBufferingConfiguration.minBufferMs, previously read only
-            // by ExoPlayer on Android. AVPlayerItem exposes a single forward-buffer
-            // knob rather than separate min/max, so minBufferMs is the closest
-            // match for "buffer this much before we risk stalling".
+            // AVPlayerItem has one forward-buffer knob. It caps how far AVPlayer
+            // reads ahead, which is ExoPlayer's maxBufferMs: minBufferMs (1s on
+            // the feed) kept iOS ~1 segment ahead while Android built a 15s
+            // reserve, so every bandwidth dip on a slow link was a stall.
             if let argsMap = call.arguments as? [String: Any] {
-                if let minBufferMs = argsMap["minBufferMs"] as? NSNumber {
-                    player.preferredForwardBufferDuration = minBufferMs.doubleValue / 1000.0
+                if let bufferMs = (argsMap["maxBufferMs"] ?? argsMap["minBufferMs"]) as? NSNumber {
+                    player.preferredForwardBufferDuration = bufferMs.doubleValue / 1000.0
                 }
                 // BetterPlayerBufferingConfiguration.bufferForPlaybackMs — the
                 // minimum buffered duration required before playback is allowed
@@ -224,8 +224,11 @@ extension SwiftBetterPlayerPlugin {
                 if let bufferForPlaybackMs = argsMap["bufferForPlaybackMs"] as? NSNumber {
                     player.bufferForPlaybackDuration = bufferForPlaybackMs.doubleValue / 1000.0
                 }
+                // Floor of 3s: when the stream's lowest variant outruns the link,
+                // resuming at 1s means a stall every couple of seconds; 3s trades
+                // that stutter for fewer, slightly longer pauses.
                 if let rebufferMs = argsMap["bufferForPlaybackAfterRebufferMs"] as? NSNumber {
-                    player.bufferForPlaybackAfterRebufferDuration = rebufferMs.doubleValue / 1000.0
+                    player.bufferForPlaybackAfterRebufferDuration = max(rebufferMs.doubleValue / 1000.0, 3.0)
                 }
             }
             onPlayerSetup(player, result: result)

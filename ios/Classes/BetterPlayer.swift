@@ -48,6 +48,11 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     // seekTo pauses (rate 0) while isPlaying stays true; the buffer and rate
     // observers must not restart playback before the seek completes.
     private var pendingSeeks = 0
+    // True from a new item or a seek until playback actually runs. A stall in
+    // that window is a (re)start, so it waits for bufferForPlayback, not the
+    // longer rebuffer gate: the 3s floor made a resumed episode wait ~11s.
+    private var awaitingFirstPlay = true
+    private var lastStallResumeAt: CFTimeInterval = 0
     private var peakBitRate: Double = 0
     // Last variant reported to Dart as "qualityChanged"; KVO and access-log
     // notifications both re-fire for the same variant.
@@ -157,6 +162,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         if size == lastQualitySize && bitrate == lastQualityBitrate { return }
         lastQualitySize = size
         lastQualityBitrate = bitrate
+        gateLog("playing \(Int(size.width))x\(Int(size.height)) @\(bitrate / 1000)kbps")
         eventSink(["event": "qualityChanged",
                    "width": NSNumber(value: Int(size.width)),
                    "height": NSNumber(value: Int(size.height)),
@@ -268,15 +274,10 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         self.stalledCount = 0
         self.isStalledCheckStarted = false
         self.playerRate = 1
-        // Mirrors the minBufferMs the Dart layer already sends for ExoPlayer
-        // (Android) via BetterPlayerBufferingConfiguration, which this iOS
-        // path previously never read. Gives AVPlayer an explicit buffer floor
-        // to offset automaticallyWaitsToMinimizeStalling being disabled above.
-        if #available(iOS 10.0, *), preferredForwardBufferDuration > 0 {
-            item.preferredForwardBufferDuration = preferredForwardBufferDuration
-        }
+        applyForwardBuffer(item)
         applyTrackCap(item)
         pendingSeeks = 0
+        awaitingFirstPlay = true
         lastQualitySize = .zero
         lastQualityBitrate = 0
         gateLog("new item cap=\(Int(maxResolution.width))x\(Int(maxResolution.height)) bitrate=\(Int(peakBitRate))")
@@ -309,14 +310,31 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     }
 
     private func startStalledCheck() {
+        // Paused by Dart (navigated away, slot parked) while the check was
+        // pending: resuming here restarted off-screen players, which then took
+        // the slow link from the one on screen.
+        guard isPlaying else {
+            isStalledCheckStarted = false
+            return
+        }
         if let currentItem = player.currentItem {
-            let resumeBuffer = bufferForPlaybackAfterRebufferDuration > 0 ? bufferForPlaybackAfterRebufferDuration : 10.0
+            let resumeBuffer = awaitingFirstPlay && bufferForPlaybackDuration > 0
+                ? bufferForPlaybackDuration
+                : (bufferForPlaybackAfterRebufferDuration > 0 ? bufferForPlaybackAfterRebufferDuration : 10.0)
             let ahead = bufferedAhead()
             // Keep counting while a seek is in flight but don't restart under it.
             // A seek on an item whose HLS connections died (long lock/background)
             // may never complete; the 60-try error below is what lets the app
             // reload the slot, so the check itself must never be skipped.
-            if pendingSeeks == 0 && (currentItem.isPlaybackLikelyToKeepUp || ahead >= resumeBuffer) {
+            // loadedTimeRanges can show seconds ahead while AVPlayer still reports
+            // the buffer empty (a range it cannot play from). Resuming then stops
+            // at once, the rate observer re-enters here, and the two spun the main
+            // thread thousands of times a second. Trust isPlaybackBufferEmpty, and
+            // never resume twice within a second: re-check on the 1s timer instead.
+            let recentlyResumed = CACurrentMediaTime() - lastStallResumeAt < 1.0
+            if pendingSeeks == 0 && !recentlyResumed && !currentItem.isPlaybackBufferEmpty
+                && (currentItem.isPlaybackLikelyToKeepUp || ahead >= resumeBuffer) {
+                lastStallResumeAt = CACurrentMediaTime()
                 gateLog(String(format: "stall -> resume ahead=%.1fs need=%.1fs", ahead, resumeBuffer))
                 play()
             } else {
@@ -341,8 +359,13 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
 
     private func hasEnoughStartupBuffer() -> Bool {
         guard bufferForPlaybackDuration > 0 else { return true }
-        if player.currentItem?.isPlaybackLikelyToKeepUp == true { return true }
-        return bufferedAhead() >= bufferForPlaybackDuration
+        guard let item = player.currentItem else { return true }
+        if item.isPlaybackLikelyToKeepUp || item.isPlaybackBufferFull { return true }
+        if item.isPlaybackBufferEmpty { return false }
+        // Near the end there may be less media left than the gate asks for.
+        let remaining = CMTimeGetSeconds(item.duration) - CMTimeGetSeconds(item.currentTime())
+        let need = remaining.isFinite ? min(bufferForPlaybackDuration, max(remaining - 0.25, 0)) : bufferForPlaybackDuration
+        return bufferedAhead() >= need
     }
 
     // Seconds buffered ahead of the playhead, from the loaded range that contains
@@ -433,6 +456,15 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
             }
         } else if context == &playbackBufferEmptyContext {
             eventSink?(["event": "bufferingStart", "key": key as Any])
+            // With automaticallyWaitsToMinimizeStalling off, AVPlayer keeps
+            // playing the (separate, small) audio rendition after video runs
+            // dry: sound over a frozen frame and the loader. Stop both; the
+            // rate observer then hands off to the stall check, which resumes
+            // them together once bufferForPlaybackAfterRebuffer is buffered.
+            if isPlaying && player.rate != 0 && player.currentItem?.isPlaybackBufferEmpty == true {
+                gateLog("buffer empty while playing -> pause for rebuffer")
+                player.pause()
+            }
         } else if context == &playbackBufferFullContext {
             eventSink?(["event": "bufferingEnd", "key": key as Any])
         }
@@ -446,7 +478,16 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
             // Each rate change is a sync XPC to mediaserverd; when it is slow the
             // main thread blocks reading rate state (app hangs, ALRIGHT-APP-11M).
             // One SetRate per play, none when already at the target rate.
-            if player.rate != playerRate { player.playImmediately(atRate: playerRate) }
+            // playImmediately ignores the buffer, and audio (a separate, tiny
+            // rendition) lands long before video on a slow link: Dart's play()
+            // started sound over a blank frame, then stalled. Hold a start from
+            // rest until the startup gate passes; the loadedTimeRanges and
+            // likelyToKeepUp observers re-run this as data arrives.
+            if player.rate == 0 && !hasEnoughStartupBuffer() { return }
+            if player.rate != playerRate {
+                player.playImmediately(atRate: playerRate)
+                awaitingFirstPlay = false
+            }
         } else if player.rate != 0 {
             // Warm slots land here on every readyToPlay/likelyToKeepUp while
             // already paused; skip the no-op SetRate.
@@ -503,12 +544,27 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         stalledCount = 0
         isStalledCheckStarted = false
         isPlaying = true
+        if let item = player.currentItem { applyForwardBuffer(item) }
         updatePlayingState()
     }
 
     public func pause() {
         isPlaying = false
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(startStalledCheckObjC), object: nil)
+        isStalledCheckStarted = false
+        if let item = player.currentItem { applyForwardBuffer(item) }
         updatePlayingState()
+    }
+
+    // A paused AVPlayer keeps filling its forward buffer. With several pooled
+    // players (previous episode, home hero, warm slots) that starved the one on
+    // screen on slow links: audio played, video sat at 0s ahead. Paused players
+    // keep just enough for a first frame; the playing one gets the full buffer.
+    private func applyForwardBuffer(_ item: AVPlayerItem) {
+        guard #available(iOS 10.0, *), preferredForwardBufferDuration > 0 else { return }
+        item.preferredForwardBufferDuration = isPlaying
+            ? preferredForwardBufferDuration
+            : min(preferredForwardBufferDuration, 2.0)
     }
 
     public func position() -> Int64 {
@@ -537,6 +593,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         let wasPlaying = isPlaying
         if wasPlaying { player.pause() }
         pendingSeeks += 1
+        awaitingFirstPlay = true
         gateLog("seek start to=\(location)ms wasPlaying=\(wasPlaying) pendingSeeks=\(pendingSeeks)")
         // Called for every seek, also with finished=false when a newer seek supersedes it.
         player.seek(to: CMTimeMake(value: Int64(location), timescale: 1000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
