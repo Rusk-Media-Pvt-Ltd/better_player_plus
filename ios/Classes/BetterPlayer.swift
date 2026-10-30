@@ -275,6 +275,10 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         self.stalledCount = 0
         self.isStalledCheckStarted = false
         self.playerRate = 1
+        // New source → back to create-time targets; a promotion override from
+        // the previous source must not leak onto a recycled warm slot.
+        overrideMinForwardBuffer = 0
+        overrideMaxForwardBuffer = 0
         // Forward-buffer target by play state (ExoPlayer-style two-level
         // LoadControl on AVPlayer's single knob): playing → maxBufferMs,
         // paused/prefetch → minBufferMs. Re-applied on every play()/pause().
@@ -503,6 +507,21 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
                    "key": key as Any])
     }
 
+    // Live override of the create-time buffer targets (0 = none). The Dart
+    // pool sets it when a prefetched warm slot is PROMOTED to the episode the
+    // user is now watching: the already-buffered prefetch stays (instant
+    // start), only the fetch-ahead targets grow. Cleared on every new data
+    // source so a recycled slot falls back to its create-time (warm) targets.
+    private var overrideMinForwardBuffer: TimeInterval = 0
+    private var overrideMaxForwardBuffer: TimeInterval = 0
+
+    public func setBufferTargets(minBuffer: TimeInterval, maxBuffer: TimeInterval) {
+        overrideMinForwardBuffer = minBuffer
+        overrideMaxForwardBuffer = maxBuffer
+        gateLog(String(format: "buffer targets override min=%.1fs max=%.1fs", minBuffer, maxBuffer))
+        applyForwardBufferTarget()
+    }
+
     // AVPlayer stops fetching once `preferredForwardBufferDuration` is buffered,
     // so a playing item must carry the big (maxBufferMs) target or it sits idle
     // after ~minBufferMs and every next segment becomes a stall race. A paused
@@ -512,9 +531,12 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     private func applyForwardBufferTarget(to newItem: AVPlayerItem? = nil) {
         guard #available(iOS 10.0, *) else { return }
         guard let item = newItem ?? player.currentItem else { return }
-        let playingTarget =
-            maxForwardBufferDuration > 0 ? maxForwardBufferDuration : preferredForwardBufferDuration
-        let target = isPlaying ? playingTarget : preferredForwardBufferDuration
+        let minTarget =
+            overrideMinForwardBuffer > 0 ? overrideMinForwardBuffer : preferredForwardBufferDuration
+        let maxTarget =
+            overrideMaxForwardBuffer > 0 ? overrideMaxForwardBuffer : maxForwardBufferDuration
+        let playingTarget = maxTarget > 0 ? maxTarget : minTarget
+        let target = isPlaying ? playingTarget : minTarget
         if target > 0, item.preferredForwardBufferDuration != target {
             item.preferredForwardBufferDuration = target
             gateLog(String(format: "buffer target -> %.1fs (%@)", target, isPlaying ? "playing" : "paused"))

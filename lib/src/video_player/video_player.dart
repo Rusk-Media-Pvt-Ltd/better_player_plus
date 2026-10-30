@@ -624,6 +624,25 @@ class VideoPlayerController extends ValueNotifier<VideoPlayerValue> {
     }
   }
 
+  /// iOS only: live-update of the forward-buffer targets on the current item.
+  /// Keeps already-buffered media; only how far ahead to fetch changes.
+  /// No-op on Android (ExoPlayer LoadControl is fixed at player creation).
+  Future<void> setBufferTargets(int minBufferMs, int maxBufferMs) async {
+    if (!_creatingCompleter.isCompleted) {
+      await _creatingCompleter.future;
+    }
+    if (_isDisposed || _textureId == null) {
+      return;
+    }
+    try {
+      await _videoPlayerPlatform.setBufferTargets(_textureId, minBufferMs, maxBufferMs);
+    } on MissingPluginException {
+      // Native player gone.
+    } on PlatformException {
+      // iOS returns FlutterMethodNotImplemented for an unknown textureId.
+    }
+  }
+
   /// Native player state plus the current source's load/decoder timeline;
   /// null before the native player exists.
   Future<String?> getNativeDiagnostics() async {

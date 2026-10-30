@@ -327,6 +327,13 @@ extension SwiftBetterPlayerPlugin {
             let bitrate = (argsMap["bitrate"] as? NSNumber)?.intValue ?? 0
             player.setTrackParameters(width: width, height: height, bitrate: bitrate)
             result(nil)
+        case "setBufferTargets":
+            // Promotion of a prefetched warm slot to CURRENT (Dart pool):
+            // live-update the forward-buffer targets, keep the buffered media.
+            let minMs = (argsMap["minBufferMs"] as? NSNumber)?.doubleValue ?? 0
+            let maxMs = (argsMap["maxBufferMs"] as? NSNumber)?.doubleValue ?? 0
+            player.setBufferTargets(minBuffer: minMs / 1000.0, maxBuffer: maxMs / 1000.0)
+            result(nil)
         case "enablePictureInPicture":
             let left = (argsMap["left"] as? NSNumber)?.doubleValue ?? 0
             let top = (argsMap["top"] as? NSNumber)?.doubleValue ?? 0
