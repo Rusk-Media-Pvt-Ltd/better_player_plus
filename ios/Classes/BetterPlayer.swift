@@ -98,6 +98,7 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     }
 
     deinit {
+        NSLog("[BetterPlayer] deinit — native player released")
         appStateObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
@@ -749,7 +750,9 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     public func dispose() {
         pause()
         disposeSansEventChannel()
+        player.replaceCurrentItem(with: nil)
         eventChannel?.setStreamHandler(nil)
+        eventSink = nil
         disablePictureInPicture()
         setPictureInPicture(false)
         disposed = true

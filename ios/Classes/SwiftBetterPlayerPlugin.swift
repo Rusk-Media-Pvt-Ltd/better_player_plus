@@ -286,10 +286,13 @@ extension SwiftBetterPlayerPlugin {
             }
             result(nil)
         case "dispose":
-            player.clear()
+            // Was clear() only: AVPlayer kept its item (decoder + network) and
+            // the event channel's stream handler kept the BetterPlayer alive,
+            // so every native dispose leaked a player.
             disposeNotificationData(player)
             setRemoteCommandsNotificationNotActive()
             players.removeValue(forKey: textureId)
+            player.dispose()
             if players.isEmpty { try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation]) }
             result(nil)
         case "setLooping":
