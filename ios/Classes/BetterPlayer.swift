@@ -33,6 +33,12 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     public var overriddenDuration: Int = 0
     public var lastAvPlayerTimeControlStatus: AVPlayer.TimeControlStatus? = nil
     public var preferredForwardBufferDuration: TimeInterval = 0
+    // ExoPlayer's maxBufferMs: how far ahead to keep downloading while PLAYING.
+    // While paused (warm pool slots prefetching) the smaller
+    // preferredForwardBufferDuration (minBufferMs) stays the target, so a warm
+    // slot's prefetch budget is unchanged. 0 = always use minBufferMs (old
+    // behaviour). See applyForwardBufferTarget().
+    public var maxForwardBufferDuration: TimeInterval = 0
     // Minimum buffered duration required before playback is allowed to start.
     // Needed because automaticallyWaitsToMinimizeStalling is disabled above,
     // which otherwise lets AVPlayer start playing the instant it's ready,
@@ -269,13 +275,10 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
         self.stalledCount = 0
         self.isStalledCheckStarted = false
         self.playerRate = 1
-        // Mirrors the minBufferMs the Dart layer already sends for ExoPlayer
-        // (Android) via BetterPlayerBufferingConfiguration, which this iOS
-        // path previously never read. Gives AVPlayer an explicit buffer floor
-        // to offset automaticallyWaitsToMinimizeStalling being disabled above.
-        if #available(iOS 10.0, *), preferredForwardBufferDuration > 0 {
-            item.preferredForwardBufferDuration = preferredForwardBufferDuration
-        }
+        // Forward-buffer target by play state (ExoPlayer-style two-level
+        // LoadControl on AVPlayer's single knob): playing → maxBufferMs,
+        // paused/prefetch → minBufferMs. Re-applied on every play()/pause().
+        applyForwardBufferTarget(to: item)
         applyTrackCap(item)
         pendingSeeks = 0
         lastQualitySize = .zero
@@ -500,15 +503,35 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
                    "key": key as Any])
     }
 
+    // AVPlayer stops fetching once `preferredForwardBufferDuration` is buffered,
+    // so a playing item must carry the big (maxBufferMs) target or it sits idle
+    // after ~minBufferMs and every next segment becomes a stall race. A paused
+    // item (warm prefetch slot) keeps the small minBufferMs target so prefetch
+    // stays ~one segment. Lowering the target never discards media already
+    // buffered; it only stops further fetching.
+    private func applyForwardBufferTarget(to newItem: AVPlayerItem? = nil) {
+        guard #available(iOS 10.0, *) else { return }
+        guard let item = newItem ?? player.currentItem else { return }
+        let playingTarget =
+            maxForwardBufferDuration > 0 ? maxForwardBufferDuration : preferredForwardBufferDuration
+        let target = isPlaying ? playingTarget : preferredForwardBufferDuration
+        if target > 0, item.preferredForwardBufferDuration != target {
+            item.preferredForwardBufferDuration = target
+            gateLog(String(format: "buffer target -> %.1fs (%@)", target, isPlaying ? "playing" : "paused"))
+        }
+    }
+
     public func play() {
         stalledCount = 0
         isStalledCheckStarted = false
         isPlaying = true
+        applyForwardBufferTarget()
         updatePlayingState()
     }
 
     public func pause() {
         isPlaying = false
+        applyForwardBufferTarget()
         updatePlayingState()
     }
 

@@ -218,6 +218,12 @@ extension SwiftBetterPlayerPlugin {
                 if let minBufferMs = argsMap["minBufferMs"] as? NSNumber {
                     player.preferredForwardBufferDuration = minBufferMs.doubleValue / 1000.0
                 }
+                // BetterPlayerBufferingConfiguration.maxBufferMs — the target
+                // while PLAYING (minBufferMs stays the paused/prefetch target),
+                // mirroring ExoPlayer's two-level LoadControl on Android.
+                if let maxBufferMs = argsMap["maxBufferMs"] as? NSNumber {
+                    player.maxForwardBufferDuration = maxBufferMs.doubleValue / 1000.0
+                }
                 // BetterPlayerBufferingConfiguration.bufferForPlaybackMs — the
                 // minimum buffered duration required before playback is allowed
                 // to start, matching ExoPlayer's semantics for this field.
