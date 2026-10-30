@@ -286,7 +286,12 @@ extension SwiftBetterPlayerPlugin {
             }
             result(nil)
         case "dispose":
-            player.clear()
+            // dispose(), not just clear(): clear() leaves the event channel's
+            // stream handler set, which kept every disposed BetterPlayer (and
+            // its AVPlayer/AVPlayerItem) alive for the engine's lifetime.
+            // Cancelling pending performs drops an in-flight stall check.
+            NSObject.cancelPreviousPerformRequests(withTarget: player)
+            player.dispose()
             disposeNotificationData(player)
             setRemoteCommandsNotificationNotActive()
             players.removeValue(forKey: textureId)

@@ -67,9 +67,15 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
 
     private var canStartPlayback: Bool { appIsActive || pictureInPicture }
 
+    // Leak check (uncomment here, in init and in deinit): live instance count.
+    // The pool keeps at most prev/current/next/hero, so n must stay <= 4.
+    // private static var aliveCount = 0
+
     public override init() {
         self.player = AVPlayer()
         super.init()
+        // BetterPlayer.aliveCount += 1
+        // NSLog("[BPAlive] created n=%d", BetterPlayer.aliveCount)
         self.player.actionAtItemEnd = .none
         if #available(iOS 10.0, *) {
             self.player.automaticallyWaitsToMinimizeStalling = false
@@ -99,6 +105,8 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
 
     deinit {
         appStateObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        // BetterPlayer.aliveCount -= 1
+        // NSLog("[BPAlive] freed   n=%d", BetterPlayer.aliveCount)
     }
 
     public convenience init(frame: CGRect) {
