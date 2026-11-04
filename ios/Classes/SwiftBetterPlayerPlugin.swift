@@ -218,6 +218,12 @@ extension SwiftBetterPlayerPlugin {
                 if let minBufferMs = argsMap["minBufferMs"] as? NSNumber {
                     player.preferredForwardBufferDuration = minBufferMs.doubleValue / 1000.0
                 }
+                // BetterPlayerBufferingConfiguration.maxBufferMs — the target
+                // while PLAYING (minBufferMs stays the paused/prefetch target),
+                // mirroring ExoPlayer's two-level LoadControl on Android.
+                if let maxBufferMs = argsMap["maxBufferMs"] as? NSNumber {
+                    player.maxForwardBufferDuration = maxBufferMs.doubleValue / 1000.0
+                }
                 // BetterPlayerBufferingConfiguration.bufferForPlaybackMs — the
                 // minimum buffered duration required before playback is allowed
                 // to start, matching ExoPlayer's semantics for this field.
@@ -320,6 +326,13 @@ extension SwiftBetterPlayerPlugin {
             let height = (argsMap["height"] as? NSNumber)?.intValue ?? 0
             let bitrate = (argsMap["bitrate"] as? NSNumber)?.intValue ?? 0
             player.setTrackParameters(width: width, height: height, bitrate: bitrate)
+            result(nil)
+        case "setBufferTargets":
+            // Promotion of a prefetched warm slot to CURRENT (Dart pool):
+            // live-update the forward-buffer targets, keep the buffered media.
+            let minMs = (argsMap["minBufferMs"] as? NSNumber)?.doubleValue ?? 0
+            let maxMs = (argsMap["maxBufferMs"] as? NSNumber)?.doubleValue ?? 0
+            player.setBufferTargets(minBuffer: minMs / 1000.0, maxBuffer: maxMs / 1000.0)
             result(nil)
         case "enablePictureInPicture":
             let left = (argsMap["left"] as? NSNumber)?.doubleValue ?? 0

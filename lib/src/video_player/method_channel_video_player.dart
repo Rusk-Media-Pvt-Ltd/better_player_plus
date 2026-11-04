@@ -138,6 +138,22 @@ class MethodChannelVideoPlayer extends VideoPlayerPlatform {
     }
   }
 
+  /// iOS only — Android's LoadControl is fixed at creation, so skip the hop.
+  @override
+  Future<void> setBufferTargets(int? textureId, int minBufferMs, int maxBufferMs) async {
+    if (textureId == null || defaultTargetPlatform != TargetPlatform.iOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod<void>(
+        'setBufferTargets',
+        <String, dynamic>{'textureId': textureId, 'minBufferMs': minBufferMs, 'maxBufferMs': maxBufferMs},
+      );
+    } on MissingPluginException {
+      // Native player gone.
+    }
+  }
+
   @override
   Future<String?> getDiagnostics(int? textureId) =>
       _channel.invokeMethod<String>('getDiagnostics', <String, dynamic>{'textureId': textureId});

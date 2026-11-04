@@ -120,6 +120,13 @@ abstract class VideoPlayerPlatform {
     throw UnimplementedError('setTrackParameters() has not been implemented.');
   }
 
+  /// iOS only: live-updates the forward-buffer targets of the current item
+  /// (used when a prefetched warm slot is promoted to the playing episode).
+  /// Android's ExoPlayer LoadControl is fixed at player creation — no-op.
+  Future<void> setBufferTargets(int? textureId, int minBufferMs, int maxBufferMs) {
+    throw UnimplementedError('setBufferTargets() has not been implemented.');
+  }
+
   /// Native player state and the current source's load/decoder timeline.
   Future<String?> getDiagnostics(int? textureId) {
     throw UnimplementedError('getDiagnostics() has not been implemented.');
