@@ -251,7 +251,13 @@ class BetterPlayerController {
       _betterPlayerSubtitlesSourceList.addAll(betterPlayerDataSource.subtitles!);
     }
 
-    if (_isDataSourceAsms(betterPlayerDataSource)) {
+    // The manifest fetch only feeds the three useAsms* lists. With all of them
+    // off its result was parsed and discarded: an extra request (separate
+    // HttpClient, the player fetches the manifest itself) on every HLS load.
+    if (_isDataSourceAsms(betterPlayerDataSource) &&
+        ((betterPlayerDataSource.useAsmsTracks ?? false) ||
+            (betterPlayerDataSource.useAsmsSubtitles ?? false) ||
+            (betterPlayerDataSource.useAsmsAudioTracks ?? false))) {
       unawaited(
         _setupAsmsDataSource(betterPlayerDataSource).then((value) {
           _setupSubtitles();
