@@ -529,7 +529,6 @@ public class BetterPlayer: NSObject, FlutterPlatformView, FlutterStreamHandler, 
     // stays ~one segment. Lowering the target never discards media already
     // buffered; it only stops further fetching.
     private func applyForwardBufferTarget(to newItem: AVPlayerItem? = nil) {
-        guard #available(iOS 10.0, *) else { return }
         guard let item = newItem ?? player.currentItem else { return }
         let minTarget =
             overrideMinForwardBuffer > 0 ? overrideMinForwardBuffer : preferredForwardBufferDuration
