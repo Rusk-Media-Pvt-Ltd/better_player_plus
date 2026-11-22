@@ -19,7 +19,8 @@ import uz.shs.better_player_plus.DataSourceUtils.getUserAgent
 import uz.shs.better_player_plus.DataSourceUtils.isHTTP
 import uz.shs.better_player_plus.DataSourceUtils.getDataSourceFactory
 import io.flutter.plugin.common.EventChannel
-import io.flutter.view.TextureRegistry.SurfaceProducer
+import io.flutter.view.TextureRegistry.SurfaceTextureEntry
+import android.view.Surface
 import io.flutter.plugin.common.MethodChannel
 import androidx.media3.ui.PlayerNotificationManager
 import androidx.work.WorkManager
@@ -97,11 +98,12 @@ import androidx.core.net.toUri
 internal class BetterPlayer(
     context: Context,
     private val eventChannel: EventChannel,
-    private val surfaceProducer: SurfaceProducer,
+    private val textureEntry: SurfaceTextureEntry,
     customDefaultLoadControl: CustomDefaultLoadControl?,
     result: MethodChannel.Result
 ) {
     private val exoPlayer: ExoPlayer?
+    private var surface: Surface? = null
     private val eventSink = QueuingEventSink()
     // Stock ABR only steps quality UP once >=10s is buffered at chunk-pick time.
     // The app's pooled feed players run 3-6s LoadControls and pick at ~1.4s
@@ -317,7 +319,7 @@ internal class BetterPlayer(
     private var abrLastBandwidthBps = 0L
 
     private fun abr(message: String) {
-        Log.d(ABR_LOG_TAG, "ABR tex=${surfaceProducer.id()} $message")
+        Log.d(ABR_LOG_TAG, "ABR tex=${textureEntry.id()} $message")
     }
 
     private fun resetAbrTrace() {
@@ -647,7 +649,7 @@ internal class BetterPlayer(
             .build()
         workManager = WorkManager.getInstance(context)
         workerObserverMap = HashMap()
-        setupVideoPlayer(eventChannel, surfaceProducer, result)
+        setupVideoPlayer(eventChannel, textureEntry, result)
     }
 
     @OptIn(UnstableApi::class)
@@ -988,7 +990,7 @@ internal class BetterPlayer(
     }
 
     private fun setupVideoPlayer(
-        eventChannel: EventChannel, surfaceProducer: SurfaceProducer, result: MethodChannel.Result
+        eventChannel: EventChannel, textureEntry: SurfaceTextureEntry, result: MethodChannel.Result
     ) {
         eventChannel.setStreamHandler(
             object : EventChannel.StreamHandler {
@@ -1001,28 +1003,16 @@ internal class BetterPlayer(
                 }
             },
         )
-        // SurfaceProducer (Impeller-native) instead of the legacy SurfaceTexture:
-        // the old path soft-fails Vulkan validation on every frame ("Invalid
-        // external texture", ~1/s) and flashed garbage on repaint on some
-        // devices. The producer owns the Surface; on lifecycle teardown it
-        // must be re-fetched, not recreated by us.
+        // SurfaceTexture, not SurfaceProducer: on API 29+ Impeller the producer is
+        // ImageReader-backed and draws the whole buffer, ignoring the decoder crop
+        // (image_external_texture.cc). Cropped HLS renditions (854 on 864, 1080 on
+        // 1088) then show green/sheared frames on MediaTek decoders. Cost: the
+        // "Invalid external texture" Vulkan validation log returns.
         // Before the first setVideoSurface so no decoder/surface event is missed.
         exoPlayer?.addAnalyticsListener(diagnosticsListener)
-        surfaceProducer.setCallback(object : SurfaceProducer.Callback {
-            override fun onSurfaceAvailable() {
-                diagSurface = "attached"
-                diag("surface_available")
-                exoPlayer?.setVideoSurface(surfaceProducer.surface)
-            }
-
-            override fun onSurfaceCleanup() {
-                diagSurface = "detached"
-                diag("surface_cleanup")
-                exoPlayer?.setVideoSurface(null)
-            }
-        })
         diagSurface = "attached"
-        exoPlayer?.setVideoSurface(surfaceProducer.surface)
+        surface = Surface(textureEntry.surfaceTexture())
+        exoPlayer?.setVideoSurface(surface)
         setAudioAttributes(exoPlayer, true)
         exoPlayer?.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -1104,7 +1094,7 @@ internal class BetterPlayer(
             abr("abr_cfg minDurationForQualityIncrease=${MIN_DURATION_FOR_QUALITY_INCREASE_MS}ms")
         }
         val reply: MutableMap<String, Any> = HashMap()
-        reply["textureId"] = surfaceProducer.id()
+        reply["textureId"] = textureEntry.id()
         result.success(reply)
     }
 
@@ -1215,9 +1205,6 @@ internal class BetterPlayer(
                     }
                     event["width"] = width
                     event["height"] = height
-                    if (width > 0 && height > 0) {
-                        surfaceProducer.setSize(width, height)
-                    }
                 }
             }
             eventSink.success(event)
@@ -1370,8 +1357,9 @@ internal class BetterPlayer(
         if (isInitialized) {
             exoPlayer?.stop()
         }
-        surfaceProducer.release()
+        textureEntry.release()
         eventChannel.setStreamHandler(null)
+        surface?.release()
         exoPlayer?.release()
     }
 
